@@ -209,6 +209,5 @@ class XBoardEngine(EngineWrapper):
             self.engine.protocol.send_line("computer")
 
 def getHomemadeEngine():
-    raise NotImplementedError(
-        "    You haven't changed the getHomemadeEngine function yet!\n"
-        "    See section \"Creating a custom bot\" in the Readme")
+    from custom_engine import ScoreEngine
+    return ScoreEngine
