@@ -4,6 +4,7 @@ import chess
 import sys
 import time
 from math import inf as INFINITY
+from collections import namedtuple
 
 PIECE_VALUES = {
     'P': 1,
@@ -70,20 +71,23 @@ cache_hits = 0
 positions = 0
 
 
-def minimax_score(board, turn, cutoff=INFINITY, curr_depth=0, max_depth=2, cache={}):
+Config = namedtuple("Config", ['prune', 'cache', 'sort', 'max_depth'], defaults=[True, True, False, 3])
+
+
+def minimax_score(board, turn, cutoff=INFINITY, curr_depth=0, cache=(), config=Config()):
 
     global cache_hits, num_pruned, positions
 
     positions += 1
 
-    if curr_depth == max_depth or board.outcome():
+    if curr_depth == config.max_depth or board.outcome():
         return improved_score(board, turn)
 
     # recursively reason about best move
 
     moves = list(board.legal_moves)
     best_move = None
-    best_score = -float('inf')  # todo: make this not ugly
+    best_score = -INFINITY
 
     for move in moves:
         # apply the current candidate move
@@ -91,33 +95,26 @@ def minimax_score(board, turn, cutoff=INFINITY, curr_depth=0, max_depth=2, cache
         new_board = board.copy()
         new_board.push(move)
 
-        # caching is probably working, but overhead makes it slower?
-        # if new_board.fen() not in cache:
-        #     score = minimax_score(new_board, not turn, -best_score,
-        #                           curr_depth + 1, max_depth, cache)
-        #
-        #     cache[new_board.fen()] = (score, curr_depth)
-        # else:
-        #     # old_score, old_depth = cache[new_board.fen()]
-        #     # if old_depth > curr_depth:
-        #     #     score = minimax_score(new_board, not turn,
-        #     #                           curr_depth + 1, max_depth, cache)
-        #     #     cache[new_board.fen()] = (score, curr_depth)
-        #     # else:
-        #     score, _ = cache[new_board.fen()]
-        #     cache_hits += 1
+        if config.cache:
+            fen = new_board.fen()
+            if fen not in cache:
+                score = minimax_score(new_board, not turn, -best_score, curr_depth + 1, cache, config)
 
-        # old version
-        score = minimax_score(new_board, not turn, -best_score,
-                              curr_depth + 1, max_depth, cache)
+                cache[fen] = score
+            else:
+                score = cache[fen]
+                cache_hits += 1
+        else:
+            score = minimax_score(new_board, not turn, -best_score, curr_depth + 1, cache, config)
 
         if score > best_score:
             best_move = move
             best_score = score
 
-        if score > cutoff:
-            num_pruned += 1
-            return -best_score
+        if config.prune:
+            if score > cutoff:
+                num_pruned += 1
+                return -best_score
 
     # print("Opponent's best move is {}".format(best_move))
 
@@ -126,16 +123,17 @@ def minimax_score(board, turn, cutoff=INFINITY, curr_depth=0, max_depth=2, cache
 
 class ScoreEngine(MinimalEngine):
 
-    def __init__(self, *args, name=None):
+    def __init__(self, *args, name=None, config=Config()):
         super().__init__(*args)
         self.name = name
         self.score_function = minimax_score
+        self.config = config
 
     def search(self, board, time_limit, ponder):
         moves = list(board.legal_moves)
 
         best_move = None
-        best_score = -float('inf')  # todo: make this not ugly
+        best_score = -INFINITY
 
         known_positions = {}
 
@@ -145,7 +143,7 @@ class ScoreEngine(MinimalEngine):
             new_board = board.copy()
             new_board.push(move)
 
-            score = self.score_function(new_board, board.turn, cache=known_positions)
+            score = self.score_function(new_board, board.turn, cache=known_positions, config=self.config, curr_depth=1)
 
             if score > best_score:
                 best_move = move
@@ -158,11 +156,25 @@ if __name__ == "__main__":
     # board = chess.Board('8/5Qpk/B4bnp/8/3r4/PR4PK/1P3P1P/6r1 b - - 2 31')
     board = chess.Board('3rk3/1p2qp2/2p2n2/1B3bp1/1b1Qp3/8/PPPP1PP1/RNB1K1N1 w Q - 0 23')
 
-    engine = ScoreEngine(None, None, sys.stderr)
-    start_time = time.time()
-    move = engine.search(board, time_limit=999, ponder=False)
-    print("Found move in {} seconds".format(time.time() - start_time))
+    configs = [Config(prune=False, cache=False),
+               Config(prune=False, cache=True),
+               Config(prune=True, cache=False),
+               Config(prune=True, cache=True),
+               ]
 
-    print("Cache hits: {}. Prunes: {}. Positions: {}.".format(cache_hits, num_pruned, positions))
+    for config in configs:
+        # todo: refactor to keep stats without global variables
+        cache_hits = 0
+        num_pruned = 0
+        positions = 0
 
-    print(move)
+        print("Starting " + repr(config))
+
+        engine = ScoreEngine(None, None, sys.stderr, config=config)
+        start_time = time.time()
+        move = engine.search(board, time_limit=999, ponder=False)
+        print("Found move in {} seconds".format(time.time() - start_time))
+
+        print("Cache hits: {}. Prunes: {}. Positions: {}.".format(cache_hits, num_pruned, positions))
+
+        print(move)
