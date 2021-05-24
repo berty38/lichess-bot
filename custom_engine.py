@@ -51,32 +51,33 @@ def improved_score(new_board, turn):
 
     score += space * 1/32
 
-    # remove hanging pieces from material count
-
-    all_pieces = new_board.piece_map().items()
-
-    for square, piece in all_pieces:
-        if piece.color == turn:
-            attacker_count = len(new_board.attackers(not turn, square))
-            defender_count = len(new_board.attackers(turn, square))
-            if attacker_count > defender_count:
-                score -= PIECE_VALUES[piece.symbol().upper()]
+    # # remove hanging pieces from material count
+    #
+    # all_pieces = new_board.piece_map().items()
+    #
+    # for square, piece in all_pieces:
+    #     if piece.color == turn:
+    #         attacker_count = len(new_board.attackers(not turn, square))
+    #         defender_count = len(new_board.attackers(turn, square))
+    #         if attacker_count > defender_count:
+    #             score -= PIECE_VALUES[piece.symbol().upper()]
 
     return score
+
 
 num_pruned = 0
 cache_hits = 0
 positions = 0
 
 
-def minimax_score(board, turn, cutoff=INFINITY, curr_depth=0, max_depth=3, cache={}):
+def minimax_score(board, turn, cutoff=INFINITY, curr_depth=0, max_depth=2, cache={}):
 
     global cache_hits, num_pruned, positions
 
     positions += 1
 
     if curr_depth == max_depth or board.outcome():
-        return material_count(board, turn)
+        return improved_score(board, turn)
 
     # recursively reason about best move
 
