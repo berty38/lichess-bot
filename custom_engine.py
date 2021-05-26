@@ -16,8 +16,11 @@ PIECE_VALUES = {
 }
 
 
-def material_count(new_board, turn):
-    # count material in the new position
+def material_count(new_board):
+    # count material in the new position for player who just moved
+
+    if new_board.is_stalemate():
+        return 0
 
     all_pieces = new_board.piece_map().values()
 
@@ -25,10 +28,10 @@ def material_count(new_board, turn):
 
     for piece in all_pieces:
         value = PIECE_VALUES[piece.piece_type]
-        if piece.color == turn:
-            material_difference += value
-        else:
+        if piece.color == new_board.turn:
             material_difference -= value
+        else:
+            material_difference += value
 
     if new_board.is_checkmate():
         material_difference += 999999
@@ -36,18 +39,18 @@ def material_count(new_board, turn):
     return material_difference
 
 
-def improved_score(new_board, turn):
-    score = material_count(new_board, turn)
+def improved_score(new_board):
+    score = material_count(new_board)
 
     # add extra score strategies
 
-    # compute space controlled by current color
+    # compute space controlled by player who just moved
 
     space = 0
     for square in chess.SQUARES:
-        if new_board.is_attacked_by(turn, square):
+        if new_board.is_attacked_by(not new_board.turn, square):
             space += 1
-        if new_board.is_attacked_by(not turn, square):
+        if new_board.is_attacked_by(new_board.turn, square):
             space -= 1
 
     score += space * 1/64
@@ -71,18 +74,22 @@ cache_hits = 0
 positions = 0
 
 
-Config = namedtuple("Config", ['prune', 'cache', 'sort', 'max_depth'], defaults=[True, True, True, 4])
+Config = namedtuple("Config",
+                    ['prune', 'cache', 'sort', 'max_depth', 'sort_heuristic'],
+                    defaults=[True, True, True, 4, None])
 
 
-def minimax_score(board, turn, opponent_best=INFINITY, my_best=-INFINITY, curr_depth=0,
-                  cache=(), config=Config()):
+def minimax_score(board, opponent_best=INFINITY, my_best=-INFINITY, curr_depth=0,
+                  cache=(), config=Config(), sort_heuristic=material_count):
 
     global cache_hits, num_pruned, positions
 
     positions += 1
 
+    turn = board.turn
+
     if curr_depth == config.max_depth or board.outcome():
-        return improved_score(board, turn)
+        return improved_score(board)
 
     # recursively reason about best move
 
@@ -99,7 +106,8 @@ def minimax_score(board, turn, opponent_best=INFINITY, my_best=-INFINITY, curr_d
         new_board = board.copy()
         new_board.push(move)
         
-        sort_score = material_count(new_board, not turn) if config.sort else 0
+        sort_score = sort_heuristic(new_board) \
+            if config.sort else 0
 
         children.append((sort_score, new_board, move))
 
@@ -118,13 +126,13 @@ def minimax_score(board, turn, opponent_best=INFINITY, my_best=-INFINITY, curr_d
 
             # if we could get a deeper estimate than what is in the cache
             if new_depth > cached_depth:
-                score = minimax_score(new_board, not turn, -my_best, -opponent_best, curr_depth + 1, cache, config)
+                score = minimax_score(new_board, -my_best, -opponent_best, curr_depth + 1, cache, config, sort_heuristic)
 
                 cache[fen] = (score, new_depth)
             else:
                 cache_hits += 1
         else:
-            score = minimax_score(new_board, not turn, -my_best, -opponent_best, curr_depth + 1, cache, config)
+            score = minimax_score(new_board, -my_best, -opponent_best, curr_depth + 1, cache, config, sort_heuristic)
 
         if score > best_score:
             best_move = move
@@ -150,6 +158,16 @@ class ScoreEngine(MinimalEngine):
         self.config = config
         self.known_positions = {}
 
+    def cached_score(self, new_board):
+        fen = new_board.fen()
+        fen = fen[:-4]  # remove move counts from fen
+        # todo: refactor to create standard modified FEN
+
+        if fen in self.known_positions:
+            score, _ = self.known_positions[fen]
+            return score
+        return material_count(new_board)
+
     def search(self, board, time_limit, ponder):
         moves = list(board.legal_moves)
 
@@ -162,8 +180,9 @@ class ScoreEngine(MinimalEngine):
             new_board = board.copy()
             new_board.push(move)
 
-            score = self.score_function(new_board, board.turn, cache=self.known_positions,
-                                        config=self.config, curr_depth=1)
+            score = self.score_function(new_board, cache=self.known_positions,
+                                        config=self.config, curr_depth=1,
+                                        sort_heuristic=self.cached_score)
 
             if score > best_score:
                 best_move = move
@@ -175,13 +194,10 @@ class ScoreEngine(MinimalEngine):
 if __name__ == "__main__":
     board = chess.Board('8/5Qpk/B4bnp/8/3r4/PR4PK/1P3P1P/6r1 b - - 2 31')
     # board = chess.Board('3rk3/1p2qp2/2p2n2/1B3bp1/1b1Qp3/8/PPPP1PP1/RNB1K1N1 w Q - 0 23')
+    board = chess.Board('Q1R5/6K1/1k6/3B4/5r1P/5rP1/8/1r6 b - - 0 1')
 
-    configs = [Config(prune=False, cache=False, sort=False),
-               #Config(prune=False, cache=True, sort=False),
-               # Config(prune=True, cache=False, sort=False),
-               #Config(prune=True, cache=True, sort=False),
-               # Config(prune=True, cache=False, sort=True),
-               #Config(prune=True, cache=True, sort=True),
+    configs = [Config(sort_heuristic=material_count, max_depth=4),
+               Config(sort_heuristic=False, max_depth=4)
                ]
 
     for config in configs:
@@ -192,7 +208,14 @@ if __name__ == "__main__":
 
         print("Starting " + repr(config))
 
+        # todo: very ugly hack to get some quick experiments
+        # configuration currently does not consider the sort heuristic.
+        # it's hard coded to use cached score.
+        if not config.sort_heuristic:
+            config = Config(sort_heuristic=engine.cached_score, max_depth=4)
+
         engine = ScoreEngine(None, None, sys.stderr, config=config)
+
         start_time = time.time()
         move = engine.search(board, time_limit=999, ponder=False)
         print("Found move in {} seconds".format(time.time() - start_time))
