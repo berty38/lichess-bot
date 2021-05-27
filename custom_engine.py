@@ -82,15 +82,14 @@ def minimax_score(board, opponent_best=INFINITY, my_best=-INFINITY, curr_depth=0
 
     turn = board.turn
 
-    # with claim_draw=False, the bot will not know about repetition.
-    # todo: find a way to avoid repetition by adding something to the cache
+    # with claim_draw=False, outcome will not know about repetition, but we handle this elsewhere
     outcome = board.outcome(claim_draw=False)
     
     if outcome:
-        if outcome.winner:
-            return 1000
-        else: 
+        if outcome.winner is None:
             return 0
+        else: 
+            return 10000 / curr_depth  # prefer shallower checkmates
 
     if curr_depth == config.max_depth:
         return improved_score(board)
@@ -165,6 +164,7 @@ class ScoreEngine(MinimalEngine):
         self.score_function = minimax_score
         self.config = config
         self.known_positions = {}
+        self.visited_positions = set()
 
     def cached_score(self, new_board):
         key = new_board._transposition_key()
@@ -174,7 +174,23 @@ class ScoreEngine(MinimalEngine):
             return score
         return material_count(new_board)
 
+    def store_position(self, board):
+        """
+        Store actually visited position. If a position has been visited before,
+        flag it for potential 3-fold repetition by zeroing its cache value
+        """
+        key = board._transposition_key()
+
+        if key in self.visited_positions:
+            self.known_positions[key] = (0, INFINITY)
+        else:
+            self.visited_positions.add(key)
+
     def search(self, board, time_limit, ponder):
+        print("Searching with time limit {} and ponder {}".format(time_limit, ponder))
+        # store current position
+        self.store_position(board)
+
         moves = list(board.legal_moves)
 
         best_move = None
@@ -194,14 +210,22 @@ class ScoreEngine(MinimalEngine):
                 best_move = move
                 best_score = score
 
+        # store new position
+        board.push(best_move)
+        self.store_position(board)
+        board.pop()
+
         return best_move
 
 
 if __name__ == "__main__":
-    #board = chess.Board('8/5Qpk/B4bnp/8/3r4/PR4PK/1P3P1P/6r1 b - - 2 31')
-    board = chess.Board('3rk3/1p2qp2/2p2n2/1B3bp1/1b1Qp3/8/PPPP1PP1/RNB1K1N1 w Q - 0 23')
-    #board = chess.Board('Q1R5/6K1/1k6/3B4/5r1P/5rP1/8/1r6 b - - 0 1')
-
+    board = chess.Board('8/5Qpk/B4bnp/8/3r4/PR4PK/1P3P1P/6r1 b - - 2 31')
+    #board = chess.Board('3rk3/1p2qp2/2p2n2/1B3bp1/1b1Qp3/8/PPPP1PP1/RNB1K1N1 w Q - 0 23')
+    #board = chess.Board('')')
+    # # obvious mate for white
+    # board = chess.Board('r3kbnr/pppppppp/8/8/8/8/PPPQPPPP/1NBRKBNR w Kkq - 0 1')
+    # # obvious mate for black
+    board = chess.Board('8/8/8/Q4q2/8/8/7r/2K5 b - - 0 1')
     configs = [Config(max_depth=3),
                #Config(sort_heuristic=False, max_depth=4)
                ]
