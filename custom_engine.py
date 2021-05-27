@@ -81,8 +81,10 @@ def minimax_score(board, opponent_best=INFINITY, my_best=-INFINITY, curr_depth=0
     positions += 1
 
     turn = board.turn
-    
-    outcome = board.outcome(claim_draw=True)
+
+    # with claim_draw=False, the bot will not know about repetition.
+    # todo: find a way to avoid repetition by adding something to the cache
+    outcome = board.outcome(claim_draw=False)
     
     if outcome:
         if outcome.winner:
@@ -105,20 +107,23 @@ def minimax_score(board, opponent_best=INFINITY, my_best=-INFINITY, curr_depth=0
     for move in moves:
         # apply the current candidate move
 
-        new_board = board.copy()
-        new_board.push(move)
+        board.push(move)
         
-        sort_score = sort_heuristic(new_board) \
+        sort_score = sort_heuristic(board) \
             if config.sort else 0
 
-        children.append((sort_score, new_board, move))
+        board.pop()
 
-    for _, new_board, move in sorted(children, key=lambda x: x[0], reverse=True):
+        children.append((sort_score, move))
+
+    for _, move in sorted(children, key=lambda x: x[0], reverse=True):
+
+        board.push(move)
 
         if config.cache:
             # The cache saves score and depth of score calculation.
 
-            key = new_board._transposition_key()
+            key = board._transposition_key()
 
             score, cached_depth = cache[key] if key in cache else (0, 0)
 
@@ -127,13 +132,15 @@ def minimax_score(board, opponent_best=INFINITY, my_best=-INFINITY, curr_depth=0
 
             # if we could get a deeper estimate than what is in the cache
             if new_depth > cached_depth:
-                score = minimax_score(new_board, -my_best, -opponent_best, curr_depth + 1, cache, config, sort_heuristic)
+                score = minimax_score(board, -my_best, -opponent_best, curr_depth + 1, cache, config, sort_heuristic)
 
                 cache[key] = (score, new_depth)
             else:
                 cache_hits += 1
         else:
-            score = minimax_score(new_board, -my_best, -opponent_best, curr_depth + 1, cache, config, sort_heuristic)
+            score = minimax_score(board, -my_best, -opponent_best, curr_depth + 1, cache, config, sort_heuristic)
+
+        board.pop()
 
         if score > best_score:
             best_move = move
