@@ -74,7 +74,7 @@ Config = namedtuple("Config",
 
 
 def minimax_score(board, opponent_best=INFINITY, my_best=-INFINITY, curr_depth=0,
-                  cache=(), config=Config(), sort_heuristic=material_count):
+                  cache=(), config=Config(), sort_heuristic=material_count, deadline=None):
 
     global cache_hits, num_pruned, positions
 
@@ -119,7 +119,9 @@ def minimax_score(board, opponent_best=INFINITY, my_best=-INFINITY, curr_depth=0
 
         board.push(move)
 
-        if config.cache:
+        if deadline and time.time() > deadline:
+            score = sort_heuristic(board)
+        elif config.cache:
             # The cache saves score and depth of score calculation.
 
             key = board._transposition_key()
@@ -187,28 +189,48 @@ class ScoreEngine(MinimalEngine):
             self.visited_positions.add(key)
 
     def search(self, board, time_limit, ponder):
-        print("Searching with time limit {} and ponder {}".format(time_limit, ponder))
+        print("Searching with time limit {} and ponder {}, turn is {}".format(time_limit, ponder, board.turn))
         # store current position
+
+        deadline = None
+        if isinstance(time_limit, int):
+            print("Using time management logic")
+            target_time = time_limit / 20 / 1000
+            deadline = time.time() + target_time
+
         self.store_position(board)
 
         moves = list(board.legal_moves)
 
-        best_move = None
-        best_score = -INFINITY
+        for depth in range(1, self.config.max_depth + 1):
 
-        for move in moves:
-            # apply the current candidate move
+            print("Trying depth {}".format(depth))
 
-            new_board = board.copy()
-            new_board.push(move)
+            new_config = Config(self.config.prune,
+                                self.config.cache,
+                                self.config.sort,
+                                depth)  # todo: make this more elegant
 
-            score = self.score_function(new_board, cache=self.known_positions,
-                                        config=self.config, curr_depth=1,
-                                        sort_heuristic=self.cached_score)
+            best_move = None
+            best_score = -INFINITY
 
-            if score > best_score:
-                best_move = move
-                best_score = score
+            for move in moves:
+                # apply the current candidate move
+
+                new_board = board.copy()
+                new_board.push(move)
+
+                score = self.score_function(new_board, cache=self.known_positions,
+                                            config=new_config, curr_depth=1,
+                                            sort_heuristic=self.cached_score, deadline=deadline)
+
+                if score > best_score:
+                    best_move = move
+                    best_score = score
+
+            if deadline and time.time() > deadline:
+                print("Ran out of time at depth {}".format(depth))
+                break
 
         # store new position
         board.push(best_move)
@@ -225,9 +247,12 @@ if __name__ == "__main__":
     # # obvious mate for white
     # board = chess.Board('r3kbnr/pppppppp/8/8/8/8/PPPQPPPP/1NBRKBNR w Kkq - 0 1')
     # # obvious mate for black
-    board = chess.Board('8/8/8/Q4q2/8/8/7r/2K5 b - - 0 1')
-    configs = [Config(max_depth=3),
-               #Config(sort_heuristic=False, max_depth=4)
+    #board = chess.Board('8/8/8/Q4q2/8/8/7r/2K5 b - - 0 1')
+    configs = [#Config(prune=False, cache=False, sort=False, max_depth=4),
+               #Config(prune=False, cache=True, sort=False, max_depth=4),
+               #Config(prune=True, cache=False, sort=False, max_depth=4),
+               #Config(prune=True, cache=True, sort=False, max_depth=4),
+               Config(prune=True, cache=True, sort=True, max_depth=3),
                ]
 
     for config in configs:
@@ -241,7 +266,7 @@ if __name__ == "__main__":
         engine = ScoreEngine(None, None, sys.stderr, config=config)
 
         start_time = time.time()
-        move = engine.search(board, time_limit=999, ponder=False)
+        move = engine.search(board, time_limit=None, ponder=False)
         print("Found move in {} seconds".format(time.time() - start_time))
 
         print("Cache hits: {}. Prunes: {}. Positions: {}.".format(cache_hits, num_pruned, positions))
