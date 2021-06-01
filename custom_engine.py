@@ -70,7 +70,7 @@ positions = 0
 
 Config = namedtuple("Config",
                     ['prune', 'cache', 'sort', 'max_depth'],
-                    defaults=[True, True, True, 4])
+                    defaults=[True, True, True, 8])
 
 
 def minimax_score(board, opponent_best=INFINITY, my_best=-INFINITY, curr_depth=0,
@@ -92,7 +92,7 @@ def minimax_score(board, opponent_best=INFINITY, my_best=-INFINITY, curr_depth=0
             return 10000 / curr_depth  # prefer shallower checkmates
 
     if curr_depth == config.max_depth:
-        return improved_score(board)
+        return sort_heuristic(board)
 
     # recursively reason about best move
 
@@ -192,11 +192,14 @@ class ScoreEngine(MinimalEngine):
         print("Searching with time limit {} and ponder {}, turn is {}".format(time_limit, ponder, board.turn))
         # store current position
 
-        deadline = None
-        if isinstance(time_limit, int):
-            print("Using time management logic")
-            target_time = time_limit / 20 / 1000
-            deadline = time.time() + target_time
+        if isinstance(time_limit, chess.engine.Limit):
+            target_time = time_limit.time
+        else:
+            # target 50 moves
+            remaining = max(10, 50 - board.fullmove_number)
+            target_time = time_limit / remaining / 1000
+        print("Trying to make move in {} seconds".format(target_time))
+        deadline = time.time() + target_time
 
         self.store_position(board)
 
@@ -211,7 +214,7 @@ class ScoreEngine(MinimalEngine):
                                 self.config.sort,
                                 depth)  # todo: make this more elegant
 
-            best_move = None
+            best_moves = []
             best_score = -INFINITY
 
             for move in moves:
@@ -225,12 +228,18 @@ class ScoreEngine(MinimalEngine):
                                             sort_heuristic=self.cached_score, deadline=deadline)
 
                 if score > best_score:
-                    best_move = move
+                    best_moves = [move]
                     best_score = score
+                elif score == best_score:
+                    best_moves.append(move)
+
+            print("Found {} moves with score {}".format(len(best_moves), best_score))
 
             if deadline and time.time() > deadline:
                 print("Ran out of time at depth {}".format(depth))
                 break
+
+        best_move = random.choice(best_moves)
 
         # store new position
         board.push(best_move)
@@ -266,7 +275,7 @@ if __name__ == "__main__":
         engine = ScoreEngine(None, None, sys.stderr, config=config)
 
         start_time = time.time()
-        move = engine.search(board, time_limit=None, ponder=False)
+        move = engine.search(board, time_limit=240000, ponder=False)
         print("Found move in {} seconds".format(time.time() - start_time))
 
         print("Cache hits: {}. Prunes: {}. Positions: {}.".format(cache_hits, num_pruned, positions))
