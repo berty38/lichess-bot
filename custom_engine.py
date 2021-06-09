@@ -33,6 +33,19 @@ def material_count(new_board):
     return material_difference
 
 
+def tiebreakers(board):
+    # count tiebreakers in the new position for player who just moved
+
+    # number of legal moves for previous player
+    board.push(chess.Move.null())
+    moves = len(list(board.legal_moves))
+    board.pop()
+    opponent_moves = len(list(board.legal_moves))
+
+    return moves - opponent_moves
+
+
+
 num_pruned = 0
 cache_hits = 0
 positions = 0
@@ -57,7 +70,7 @@ class ScoreEngine(MinimalEngine):
         if key in self.known_positions:
             score, _ = self.known_positions[key]
             return score
-        return material_count(new_board)
+        return material_count(new_board) + 0.0001 * tiebreakers(new_board)
 
     def store_position(self, board):
         """
@@ -120,10 +133,10 @@ class ScoreEngine(MinimalEngine):
         if key in self.known_positions:
             score, _ = self.known_positions[key]
         else:
-            score = self.negamax_score(board, curr_depth=1, deadline=None,
-                                  generate_children=self.loud_moves_only,
-                                  evaluation_function=self.cached_score,
-                                  caching=False, early_stop=True, max_depth=2)
+            score = self.negamax_score(board, curr_depth=1, deadline=time.time() + 1,
+                                       generate_children=self.loud_moves_only,
+                                       evaluation_function=self.cached_score,
+                                       caching=False, early_stop=True, max_depth=8)
             self.known_positions[key] = (score, 0)
         return score
 
