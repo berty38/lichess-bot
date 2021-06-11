@@ -200,5 +200,5 @@ class XBoardEngine(EngineWrapper):
             self.engine.protocol.send_line("computer")
 
 def getHomemadeEngine():
-    from custom_engine import ScoreEngine
-    return ScoreEngine
+    from LearningEngine import LearningEngine
+    return LearningEngine

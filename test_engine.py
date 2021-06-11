@@ -4,6 +4,8 @@ from custom_engine import ScoreEngine, material_count, tiebreakers
 import sys
 import math
 import time
+from LearningEngine import LearningEngine
+import numpy as np
 
 missing_rook_white = 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBN1 w Qkq - 0 1'
 missing_rook_black = 'rnbqkbn1/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQq - 0 1'
@@ -12,6 +14,11 @@ mate_in_two = '8/6Q1/8/8/7k/4K3/8/8 w - - 2 2'
 hanging_queen = '8/8/7Q/7k/5K2/8/8/8 b - - 0 1'
 bad_check = '8/8/Q7/1P5k/8/8/6q1/1K6 w - - 0 1'
 opening_error = 'r1bqkb1r/pppn1ppp/3Pp3/4n2Q/8/3B4/PPPP1PPP/RNB1K1NR w KQkq - 1 7'
+opening_error_flipped = 'r1bqkb1r/pppn1ppp/3Pp3/4n2Q/8/3B4/PPPP1PPP/RNB1K1NR b KQkq - 1 7'
+
+imbalanced_material_white = 'r1b1k1nr/pppppppp/8/8/8/8/PPP1PPPP/1NBQKBN1 w kq - 0 1'
+imbalanced_material_black = 'r1b1k1nr/pppppppp/8/8/8/8/PPP1PPPP/1NBQKBN1 b kq - 0 1'
+
 
 
 class EngineTestCase(unittest.TestCase):
@@ -128,6 +135,38 @@ class EngineTestCase(unittest.TestCase):
         score = tiebreakers(board)
 
         print("Tiebreaker score is {}".format(score))
+
+    def test_learning_features(self):
+        board = chess.Board(imbalanced_material_white)
+
+        engine = LearningEngine(None, None, sys.stderr)
+
+        features = engine.features(board)
+
+        flipped_board = chess.Board(imbalanced_material_black)
+
+        flipped_features = engine.features(flipped_board)
+
+        print("Features for white to move:")
+        print(features)
+        print("Features for black to move:")
+        print(flipped_features)
+
+        self.assertTrue(np.allclose(features, -flipped_features))
+
+    def test_weight_saving(self):
+        engine = LearningEngine(None, None, sys.stderr)
+        print("Initialized engine with weights")
+        print(engine.weights)
+
+        path = "weights.json"  # todo: make this a proper temp file
+        engine.save_weights(path)
+
+        new_engine = LearningEngine(None, None, sys.stderr, weight_file=path)
+        print("New engine loaded with weights")
+        print(new_engine.weights)
+
+        self.assertTrue(np.allclose(new_engine.weights, engine.weights))
 
 if __name__ == '__main__':
     unittest.main()
