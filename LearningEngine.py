@@ -9,7 +9,7 @@ import json
 
 class LearningEngine(MinimalEngine):
 
-    def __init__(self, *args, name=None, weights=None, weight_file=None):
+    def __init__(self, *args, name=None, weights=None, weight_file="weights.json"):
         super().__init__(*args)
         self.name = name
 
@@ -24,10 +24,6 @@ class LearningEngine(MinimalEngine):
             starting_board = chess.Board()
             descriptor = self.features(starting_board)
             self.weights = np.random.rand(descriptor.size)
-
-            # todo: remove this. This is just for curiosity
-            #P: 24.99, N: 13.89, B: 16.21, R: 24.96, Q: 9.19, K: 0.00, M: 25.00
-            self.weights = np.array([25, 13.9, 16.2, 24.96, 9.19, 0, 25])
         else:
             self.weights = weights
 
