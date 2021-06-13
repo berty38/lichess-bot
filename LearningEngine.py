@@ -7,6 +7,33 @@ import codecs
 import json
 
 
+PIECE_VALUES = {
+    chess.PAWN: 1,
+    chess.KNIGHT: 3,
+    chess.BISHOP: 3,
+    chess.ROOK: 5,
+    chess.QUEEN: 9,
+    chess.KING: 0,
+}
+
+
+def material_count(new_board):
+    # count material in the new position for player to move
+
+    all_pieces = new_board.piece_map().values()
+
+    material_difference = 0
+
+    for piece in all_pieces:
+        value = PIECE_VALUES[piece.piece_type]
+        if piece.color == new_board.turn:
+            material_difference += value
+        else:
+            material_difference -= value
+
+    return material_difference
+
+
 class LearningEngine(MinimalEngine):
 
     def __init__(self, *args, name=None, weights=None, weight_file="weights.json"):
@@ -33,7 +60,7 @@ class LearningEngine(MinimalEngine):
         Returns a numerical vector describing the board position
         """
 
-        all_pieces = board.piece_map().values()
+        all_pieces = board.piece_map().items()
 
         features = np.zeros(7)
 
@@ -46,15 +73,31 @@ class LearningEngine(MinimalEngine):
             chess.KING: 5
         }
 
-        for piece in all_pieces:
+        piece_grid = np.zeros((64, 6))
+
+        for position, piece in all_pieces:
             value = -1 if piece.color == board.turn else 1
 
-            features[index[piece.piece_type]] += value
+            type_index = index[piece.piece_type]
+
+            features[type_index] += value
+
+            piece_grid[position, type_index] = value
 
         if board.is_checkmate():
             features[6] = 1
 
-        return features
+        return np.concatenate((features, piece_grid.ravel()))
+
+    def action_score(self, board, move):
+        # calculate score
+        board.push(move)
+        descriptor = self.features(board)
+        board.pop()
+
+        score = self.weights.dot(descriptor)
+
+        return score
 
     def search(self, board, time_limit, ponder):
 
@@ -64,15 +107,10 @@ class LearningEngine(MinimalEngine):
 
         for i, move in enumerate(moves):
             # apply the current candidate move
-            board.push(move)
 
-            # calculate score
-            descriptor = self.features(board)
-            scores[i] = self.weights.dot(descriptor)
+            scores[i] = self.action_score(board, move)
 
-            board.pop()
-
-        probs = np.exp(scores)
+        probs = np.exp(scores - scores.max())
         probs /= np.sum(probs)
 
         samples = np.random.multinomial(1, probs)
@@ -85,17 +123,38 @@ class LearningEngine(MinimalEngine):
         with codecs.open(filepath, 'w', encoding='utf-8') as fopen:
             json.dump(weight_list, fopen)
 
+    def q_learn(self, reward, prev_board, prev_move, new_board, learning_rate=0.0001, discount=1.0):
+        # q(a, s) is estimate of discounted future reward after
+        #       making move a from s
+        # q(a, s) <- q(a, s) + learning_rate *
+        #                       (reward +  max_{a'} q(a', s') - q(a, s))
+        # weights <- weights + learning_rate *
+        #                       (reward +
+
+        moves = list(new_board.legal_moves)
+        if len(moves) == 0:
+            max_future_score = 0
+        else:
+            max_future_score = max([self.action_score(new_board, move) for move in moves])
+
+        prev_board.push(prev_move)
+        descriptor = self.features(prev_board)
+        prev_board.pop()
+
+        self.weights += learning_rate * (reward + discount * max_future_score -
+                                         self.action_score(prev_board, prev_move)) * descriptor
+
 
 if __name__ == "__main__":
     engine_white = LearningEngine(None, None, sys.stderr)
     board = chess.Board()
 
-    engine_white.weights[0] = 1.0
+    engine_black = LearningEngine(None, None, sys.stderr, weights=None, weight_file=None)
 
-    engine_black = LearningEngine(None, None, sys.stderr)
-
-    engine_black.weights = np.array([1., 3., 3., 5., 9., 0., 25.])
-    engine_white.weights = np.array([1., 1., 1., 1., 1., 0., 25.])
+    engine_black.weights[:7] = [1., 3., 3., 5., 9., 0., 25.]
+    engine_black.weights[7:] = 0
+    # engine_white.weights[:7] = [1., 3., 3., 5., 9., 0., 25.]
+    # engine_white.weights[7:] = 0
 
     wins = 0
     losses = 0
@@ -107,64 +166,54 @@ if __name__ == "__main__":
         board = chess.Board()
 
         white_positions = []
-        black_positions = []
+        white_moves = []
+
+        # play a single game
 
         while not board.outcome() and board.fullmove_number < max_moves:
             if board.turn == chess.WHITE:
-                black_positions.append(engine_white.features(board))
+                white_positions.append(board.copy())
                 move = engine_white.search(board, 1000, True)
+                white_moves.append(move)
             else:
-                white_positions.append(engine_black.features(board))
                 move = engine_black.search(board, 1000, True)
 
             #print(board.san(move))
             board.push(move)
 
+        # do learning on all steps of the game
+
         outcome = board.outcome(claim_draw=True)
 
-        learning_rate = 0.001
+        learning_rate = 0.1
 
+        # do q-learning on each of white's moves
+        for i in range(len(white_moves) - 1):
+            reward = material_count(white_positions[i + 1]) - \
+                     material_count(white_positions[i])
+            engine_white.q_learn(reward, white_positions[i], white_moves[i],
+                                 white_positions[i + 1])
+
+        # final move
         if outcome and outcome.winner == chess.WHITE:
-            print("White wins")
-
-            # learn from white's "winning" positions
-            for position in white_positions:
-                engine_white.weights += learning_rate * position
-            # learn from black's "losing" positions
-            for position in black_positions:
-                engine_white.weights -= learning_rate * position
-
+            reward = 100
             wins += 1
-
         elif outcome and outcome.winner == chess.BLACK:
-            print("Black wins")
-
-            # learn from white's "losing" positions
-            for position in white_positions:
-                engine_white.weights -= learning_rate * position
-            # learn from black's "winning" positions
-            for position in black_positions:
-                engine_white.weights += learning_rate * position
-
+            reward = -100
             losses += 1
-
         else:
-            print("Draw")
-
-            # learn from white's "drawn" positions
-            for position in white_positions:
-                engine_white.weights -= learning_rate * position
-            # learn from black's "drawn" positions
-            for position in black_positions:
-                engine_white.weights -= learning_rate * position
-
+            reward = 0
             draws += 1
 
-        # engine_white.weights[0] = 1
-        engine_white.weights = engine_white.weights.clip(min=0, max=25)
+        engine_white.q_learn(reward, white_positions[-1], white_moves[-1],
+                             chess.Board('8/8/8/8/8/8/8/8 w - - 0 1'))
 
+        # clip weights
+        engine_white.weights = engine_white.weights.clip(min=-25, max=25)
+
+
+        # print diagnostic info
         weights = engine_white.weights
-
         print("P: {:.2f}, N: {:.2f}, B: {:.2f}, R: {:.2f}, Q: {:.2f}, K: {:.2f}, M: {:.2f}".format(
             weights[0], weights[1], weights[2], weights[3], weights[4], weights[5],
             weights[6]))
