@@ -5,7 +5,10 @@ from math import inf
 import sys
 import codecs
 import json
-
+from tensorflow import summary
+import matplotlib.pyplot as plt
+from io import StringIO
+from datetime import datetime
 
 PIECE_VALUES = {
     chess.PAWN: 1,
@@ -84,6 +87,8 @@ class LearningEngine(MinimalEngine):
 
             piece_grid[position, type_index] = value
 
+            # todo: mirror board depending on which color
+
         if board.is_checkmate():
             features[6] = 1
 
@@ -146,6 +151,13 @@ class LearningEngine(MinimalEngine):
 
 
 if __name__ == "__main__":
+
+    time_string = datetime.now().strftime("%Y%m%d-%H%M%S")
+    log_dir = 'logs/{}'.format(time_string)
+    writer = summary.create_file_writer(log_dir)
+
+    step = 0
+
     engine_white = LearningEngine(None, None, sys.stderr)
     board = chess.Board()
 
@@ -153,8 +165,8 @@ if __name__ == "__main__":
 
     engine_black.weights[:7] = [1., 3., 3., 5., 9., 0., 25.]
     engine_black.weights[7:] = 0
-    # engine_white.weights[:7] = [1., 3., 3., 5., 9., 0., 25.]
-    # engine_white.weights[7:] = 0
+    engine_white.weights[:7] = [1., 3., 3., 5., 9., 0., 25.]
+    engine_white.weights[7:] = 0
 
     wins = 0
     losses = 0
@@ -196,10 +208,10 @@ if __name__ == "__main__":
 
         # final move
         if outcome and outcome.winner == chess.WHITE:
-            reward = 100
+            reward = 1000
             wins += 1
         elif outcome and outcome.winner == chess.BLACK:
-            reward = -100
+            reward = -1000
             losses += 1
         else:
             reward = 0
@@ -209,8 +221,31 @@ if __name__ == "__main__":
                              chess.Board('8/8/8/8/8/8/8/8 w - - 0 1'))
 
         # clip weights
-        engine_white.weights = engine_white.weights.clip(min=-25, max=25)
+        # engine_white.weights = engine_white.weights.clip(min=-25, max=25)
 
+        # log diagnostic info
+        with writer.as_default():
+            summary.scalar('Reward', reward, step)
+            summary.scalar('P', engine_white.weights[0], step)
+            summary.scalar('N', engine_white.weights[1], step)
+            summary.scalar('B', engine_white.weights[2], step)
+            summary.scalar('R', engine_white.weights[3], step)
+            summary.scalar('Q', engine_white.weights[4], step)
+            summary.scalar('M', engine_white.weights[6], step)
+
+        if step % 10 == 0:
+            # plot weights
+            pieces = ['P', 'N', 'B', 'R', 'Q', 'K']
+            piece_weights = engine_white.weights[7:].reshape((64, 6))
+            max_weight = piece_weights.max()
+
+            im_summaries = []
+
+            for i, p in enumerate(pieces):
+                slice = piece_weights[:, i].reshape((8, 8, 1)) / max_weight
+
+                with writer.as_default():
+                    summary.image("Weights-{}".format(p), [slice], step)
 
         # print diagnostic info
         weights = engine_white.weights
@@ -222,4 +257,6 @@ if __name__ == "__main__":
             wins, losses, draws, wins / (wins + losses + draws), wins / (losses + 1e-16)))
 
         engine_white.save_weights("weights.json")
+
+        step += 1
 
