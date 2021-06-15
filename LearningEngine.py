@@ -9,6 +9,7 @@ from tensorflow import summary
 import matplotlib.pyplot as plt
 from io import StringIO
 from datetime import datetime
+import tempfile
 
 PIECE_VALUES = {
     chess.PAWN: 1,
@@ -63,6 +64,10 @@ class LearningEngine(MinimalEngine):
         Returns a numerical vector describing the board position
         """
 
+        # mirror board if black's turn
+        if board.turn == chess.BLACK:
+            board = board.mirror()
+        
         all_pieces = board.piece_map().items()
 
         features = np.zeros(7)
@@ -86,8 +91,6 @@ class LearningEngine(MinimalEngine):
             features[type_index] += value
 
             piece_grid[position, type_index] = value
-
-            # todo: mirror board depending on which color
 
         if board.is_checkmate():
             features[6] = 1
@@ -153,8 +156,12 @@ class LearningEngine(MinimalEngine):
 if __name__ == "__main__":
 
     time_string = datetime.now().strftime("%Y%m%d-%H%M%S")
-    log_dir = 'logs/{}'.format(time_string)
-    writer = summary.create_file_writer(log_dir)
+
+    # base_dir = tempfile.TemporaryDirectory().name
+    base_dir = "/Users/bert/Desktop"
+    log_dir = '{}/logs/'.format(base_dir)
+    print("Storing logs in {}".format(log_dir))
+    writer = summary.create_file_writer(log_dir + time_string)
 
     step = 0
 
