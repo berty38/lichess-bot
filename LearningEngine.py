@@ -40,9 +40,12 @@ def material_count(new_board):
 
 class LearningEngine(MinimalEngine):
 
-    def __init__(self, *args, name=None, weights=None, weight_file="weights.json"):
+    def __init__(self, *args, name=None, weights=None, weight_file="weights.json", projection_seed=0):
         super().__init__(*args)
         self.name = name
+
+        random_state = np.random.RandomState(projection_seed)
+        self.projection = random_state.randn(395, 395)  # todo: make this more flexible
 
         if weight_file:
             # load weights from file
@@ -52,14 +55,14 @@ class LearningEngine(MinimalEngine):
             self.weights = np.array(weight_list)
         elif weights is None:
             # initialize weights
+            print("Initializing new weights")
             starting_board = chess.Board()
             descriptor = self.features(starting_board)
             self.weights = np.random.rand(descriptor.size)
         else:
             self.weights = weights
 
-    @staticmethod
-    def features(board):
+    def features(self, board):
         """
         Returns a numerical vector describing the board position
         """
@@ -81,6 +84,14 @@ class LearningEngine(MinimalEngine):
             chess.KING: 5
         }
 
+        # add castling rights
+        cr = board.castling_rights
+
+        castling = [board.has_kingside_castling_rights(chess.WHITE),
+                    board.has_queenside_castling_rights(chess.WHITE),
+                    board.has_kingside_castling_rights(chess.BLACK),
+                    board.has_queenside_castling_rights(chess.BLACK)]
+
         piece_grid = np.zeros((64, 6))
 
         for position, piece in all_pieces:
@@ -95,7 +106,11 @@ class LearningEngine(MinimalEngine):
         if board.is_checkmate():
             features[6] = 1
 
-        return np.concatenate((features, piece_grid.ravel()))
+        return self.random_project(np.concatenate((features, castling, piece_grid.ravel())))
+
+    def random_project(self, x):
+        projections = self.projection.dot(x) > 0
+        return np.concatenate((x, projections))
 
     def action_score(self, board, move):
         # calculate score
@@ -166,14 +181,17 @@ if __name__ == "__main__":
     step = 0
 
     engine_white = LearningEngine(None, None, sys.stderr)
+    # Use this next line to re-initialize bot
+    # engine_white = LearningEngine(None, None, sys.stderr, weights=None, weight_file=None)
+
     board = chess.Board()
 
     engine_black = LearningEngine(None, None, sys.stderr, weights=None, weight_file=None)
 
     engine_black.weights[:7] = [1., 3., 3., 5., 9., 0., 25.]
     engine_black.weights[7:] = 0
-    engine_white.weights[:7] = [1., 3., 3., 5., 9., 0., 25.]
-    engine_white.weights[7:] = 0
+    # engine_white.weights[:7] = [1., 3., 3., 5., 9., 0., 25.]
+    # engine_white.weights[7:] = 0
 
     wins = 0
     losses = 0
@@ -243,7 +261,7 @@ if __name__ == "__main__":
         if step % 10 == 0:
             # plot weights
             pieces = ['P', 'N', 'B', 'R', 'Q', 'K']
-            piece_weights = engine_white.weights[7:].reshape((64, 6))
+            piece_weights = engine_white.weights[11:(11 + 64 * 6)].reshape((64, 6))
             max_weight = piece_weights.max()
 
             im_summaries = []
