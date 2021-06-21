@@ -4,7 +4,7 @@ from custom_engine import ScoreEngine, material_count, tiebreakers
 import sys
 import math
 import time
-from LearningEngine import LearningEngine
+from LearningEngine import LearningEngine, CircleBuffer
 import numpy as np
 
 missing_rook_white = 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBN1 w Qkq - 0 1'
@@ -167,6 +167,25 @@ class EngineTestCase(unittest.TestCase):
         print(new_engine.weights)
 
         self.assertTrue(np.allclose(new_engine.weights, engine.weights))
+
+    def test_circ_buff(self):
+        buffer = CircleBuffer(max_size=4)
+
+        buffer.add_item('a')
+        buffer.add_item('b')
+        buffer.add_item('c')
+        buffer.add_item('d')
+
+        print(buffer)
+
+        self.assertEqual(tuple(buffer), ('a', 'b', 'c', 'd'))
+
+        buffer.add_item('e')
+        buffer.add_item('f')
+
+        print(buffer)
+        self.assertEqual(tuple(buffer), ('e', 'f', 'c', 'd'))
+
 
 if __name__ == '__main__':
     unittest.main()

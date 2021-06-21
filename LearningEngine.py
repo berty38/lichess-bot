@@ -38,16 +38,39 @@ def material_count(new_board):
     return material_difference
 
 
+class CircleBuffer(list):
+    def __init__(self, max_size):
+        super().__init__()
+        self.cursor = 0
+        self.max_size = max_size
+
+    def add_item(self, x):
+        if len(self) < self.max_size:
+            self.append(x)
+        else:
+            # print("Buffer is full")
+            self[self.cursor] = x
+            self.cursor = (self.cursor + 1) % self.max_size
+
+
 class LearningEngine(MinimalEngine):
 
-    def __init__(self, *args, name=None, weights=None, weight_file="weights.json", projection_seed=0):
+    def __init__(self, *args, name=None, weights=None, weight_file="weights.json", projection_seed=0,
+                 temperature=1, buffer_size=100000, batch_size=1):
         super().__init__(*args)
         self.name = name
 
-        random_state = np.random.RandomState(projection_seed)
-        self.projection = random_state.randn(395, 395)  # todo: make this more flexible
+        self.random_state = np.random.RandomState(projection_seed)
+        self.projection = self.random_state.randn(395, 395)  # todo: make this more flexible
+        self.offset = 2 * np.pi * self.random_state.rand(395)
+
+        self.temperature = temperature
+
+        self.buffer = CircleBuffer(buffer_size)
+        self.batch_size = batch_size
 
         if weight_file:
+            print("Loading weights from file")
             # load weights from file
             with codecs.open(weight_file, 'r', encoding='utf-8') as fopen:
                 weight_test = fopen.read()
@@ -109,7 +132,7 @@ class LearningEngine(MinimalEngine):
         return self.random_project(np.concatenate((features, castling, piece_grid.ravel())))
 
     def random_project(self, x):
-        projections = self.projection.dot(x) > 0
+        projections = np.cos(self.projection.dot(x) + self.offset)
         return np.concatenate((x, projections))
 
     def action_score(self, board, move):
@@ -133,6 +156,8 @@ class LearningEngine(MinimalEngine):
 
             scores[i] = self.action_score(board, move)
 
+        scores *= self.temperature
+
         probs = np.exp(scores - scores.max())
         probs /= np.sum(probs)
 
@@ -151,21 +176,29 @@ class LearningEngine(MinimalEngine):
         #       making move a from s
         # q(a, s) <- q(a, s) + learning_rate *
         #                       (reward +  max_{a'} q(a', s') - q(a, s))
-        # weights <- weights + learning_rate *
-        #                       (reward +
 
-        moves = list(new_board.legal_moves)
-        if len(moves) == 0:
-            max_future_score = 0
-        else:
-            max_future_score = max([self.action_score(new_board, move) for move in moves])
+        # store position in buffer
+        self.buffer.add_item((reward, prev_board.copy(), prev_move, new_board))
 
-        prev_board.push(prev_move)
-        descriptor = self.features(prev_board)
-        prev_board.pop()
+        # compute q-learning lookahead score
+        for _ in range(self.batch_size):
 
-        self.weights += learning_rate * (reward + discount * max_future_score -
-                                         self.action_score(prev_board, prev_move)) * descriptor
+            i = self.random_state.randint(0, len(self.buffer))
+            batch_reward, batch_prev_board, batch_prev_move, batch_new_board = self.buffer[i]
+
+            moves = list(batch_new_board.legal_moves)
+            if len(moves) == 0:
+                max_future_score = 0
+            else:
+                max_future_score = max([self.action_score(batch_new_board, move) for move in moves])
+
+            batch_prev_board.push(batch_prev_move)
+            descriptor = self.features(batch_prev_board)
+            batch_prev_board.pop()
+
+            # update weights
+            self.weights += learning_rate * (batch_reward + discount * max_future_score -
+                                             self.action_score(batch_prev_board, batch_prev_move)) * descriptor
 
 
 if __name__ == "__main__":
@@ -180,18 +213,19 @@ if __name__ == "__main__":
 
     step = 0
 
-    engine_white = LearningEngine(None, None, sys.stderr)
+    # Use this next line to load bot weights from disk
+    #engine_white = LearningEngine(None, None, sys.stderr)
     # Use this next line to re-initialize bot
-    # engine_white = LearningEngine(None, None, sys.stderr, weights=None, weight_file=None)
+    engine_white = LearningEngine(None, None, sys.stderr, weights=None, weight_file=None)
 
     board = chess.Board()
 
     engine_black = LearningEngine(None, None, sys.stderr, weights=None, weight_file=None)
 
-    engine_black.weights[:7] = [1., 3., 3., 5., 9., 0., 25.]
+    engine_black.weights[:7] = [1., 3., 3., 5., 9., 0., 1000.]
     engine_black.weights[7:] = 0
-    # engine_white.weights[:7] = [1., 3., 3., 5., 9., 0., 25.]
-    # engine_white.weights[7:] = 0
+    engine_white.weights[:7] = [1., 3., 3., 5., 9., 0., 1000.]
+    engine_white.weights[7:] = 0
 
     wins = 0
     losses = 0
@@ -200,6 +234,11 @@ if __name__ == "__main__":
     max_moves = 100
 
     while True:
+        # Occasionally update black to match white's weights
+        if (wins + losses + draws) % 5000 == 0:
+            print("Updating black to match learned weights")
+            engine_black.weights = engine_white.weights
+        
         board = chess.Board()
 
         white_positions = []
@@ -221,8 +260,6 @@ if __name__ == "__main__":
         # do learning on all steps of the game
 
         outcome = board.outcome(claim_draw=True)
-
-        learning_rate = 0.1
 
         # do q-learning on each of white's moves
         for i in range(len(white_moves) - 1):
