@@ -56,7 +56,7 @@ class CircleBuffer(list):
 class LearningEngine(MinimalEngine):
 
     def __init__(self, *args, name=None, weights=None, weight_file="weights.json", projection_seed=0,
-                 temperature=1, buffer_size=100000, batch_size=1):
+                 temperature=1, buffer_size=100000, batch_size=10):
         super().__init__(*args)
         self.name = name
 
@@ -178,27 +178,31 @@ class LearningEngine(MinimalEngine):
         #                       (reward +  max_{a'} q(a', s') - q(a, s))
 
         # store position in buffer
-        self.buffer.add_item((reward, prev_board.copy(), prev_move, new_board))
+        prev_board.push(prev_move)
+        prev_features = self.features(prev_board)
+        prev_board.pop()
+        new_boards = []
+        for move in new_board.legal_moves:
+            new_board.push(move)
+            new_boards.append(self.features(new_board))
+            new_board.pop()
+        self.buffer.add_item((reward, prev_features, new_boards))
 
-        # compute q-learning lookahead score
         for _ in range(self.batch_size):
 
             i = self.random_state.randint(0, len(self.buffer))
-            batch_reward, batch_prev_board, batch_prev_move, batch_new_board = self.buffer[i]
+            batch_reward, batch_prev_features, batch_new_boards = self.buffer[i]
 
-            moves = list(batch_new_board.legal_moves)
-            if len(moves) == 0:
+            # compute q-learning lookahead score
+            if len(batch_new_boards) == 0:
                 max_future_score = 0
             else:
-                max_future_score = max([self.action_score(batch_new_board, move) for move in moves])
-
-            batch_prev_board.push(batch_prev_move)
-            descriptor = self.features(batch_prev_board)
-            batch_prev_board.pop()
+                max_future_score = max([self.weights.dot(features)
+                                        for features in batch_new_boards])
 
             # update weights
             self.weights += learning_rate * (batch_reward + discount * max_future_score -
-                                             self.action_score(batch_prev_board, batch_prev_move)) * descriptor
+                                             self.weights.dot(batch_prev_features)) * batch_prev_features
 
 
 if __name__ == "__main__":
@@ -222,10 +226,12 @@ if __name__ == "__main__":
 
     engine_black = LearningEngine(None, None, sys.stderr, weights=None, weight_file=None)
 
-    engine_black.weights[:7] = [1., 3., 3., 5., 9., 0., 1000.]
-    engine_black.weights[7:] = 0
-    engine_white.weights[:7] = [1., 3., 3., 5., 9., 0., 1000.]
-    engine_white.weights[7:] = 0
+    # engine_black.weights[:7] = [1., 3., 3., 5., 9., 0., 100.]
+    # engine_black.weights[7:] = 0
+    # engine_white.weights[:7] = [1., 3., 3., 5., 9., 0., 100.]
+    # engine_white.weights[7:] = 0
+    engine_black.weights *= 0
+    engine_white.weights *= 0
 
     wins = 0
     losses = 0
@@ -237,7 +243,7 @@ if __name__ == "__main__":
         # Occasionally update black to match white's weights
         if (wins + losses + draws) % 5000 == 0:
             print("Updating black to match learned weights")
-            engine_black.weights = engine_white.weights
+            engine_black.weights = engine_white.weights.copy()
         
         board = chess.Board()
 
@@ -261,23 +267,31 @@ if __name__ == "__main__":
 
         outcome = board.outcome(claim_draw=True)
 
+        rewards = []
+
         # do q-learning on each of white's moves
         for i in range(len(white_moves) - 1):
             reward = material_count(white_positions[i + 1]) - \
                      material_count(white_positions[i])
+            rewards.append(reward)
+
             engine_white.q_learn(reward, white_positions[i], white_moves[i],
                                  white_positions[i + 1])
 
         # final move
         if outcome and outcome.winner == chess.WHITE:
-            reward = 1000
+            reward = 100
             wins += 1
         elif outcome and outcome.winner == chess.BLACK:
-            reward = -1000
+            reward = -100
             losses += 1
         else:
             reward = 0
             draws += 1
+
+        rewards.append(reward)
+
+        episode_reward = np.sum(rewards)
 
         engine_white.q_learn(reward, white_positions[-1], white_moves[-1],
                              chess.Board('8/8/8/8/8/8/8/8 w - - 0 1'))
@@ -287,7 +301,8 @@ if __name__ == "__main__":
 
         # log diagnostic info
         with writer.as_default():
-            summary.scalar('Reward', reward, step)
+            summary.scalar('Reward', episode_reward, step)
+            summary.scalar('Result', reward / 100, step)
             summary.scalar('P', engine_white.weights[0], step)
             summary.scalar('N', engine_white.weights[1], step)
             summary.scalar('B', engine_white.weights[2], step)

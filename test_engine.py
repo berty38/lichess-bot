@@ -168,6 +168,13 @@ class EngineTestCase(unittest.TestCase):
 
         self.assertTrue(np.allclose(new_engine.weights, engine.weights))
 
+    def test_random_feature_seeding(self):
+        engine1 = LearningEngine(None, None, sys.stderr)
+        engine2 = LearningEngine(None, None, sys.stderr)
+
+        self.assertTrue(np.allclose(engine1.projection, engine2.projection))
+        self.assertTrue(np.allclose(engine1.offset, engine2.offset))
+
     def test_circ_buff(self):
         buffer = CircleBuffer(max_size=4)
 
