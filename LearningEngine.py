@@ -10,6 +10,7 @@ import matplotlib.pyplot as plt
 from io import StringIO
 from datetime import datetime
 import tempfile
+import time
 
 PIECE_VALUES = {
     chess.PAWN: 1,
@@ -38,6 +39,23 @@ def material_count(new_board):
     return material_difference
 
 
+def print_game(board):
+    new_board = chess.Board()
+    san_moves = []
+    for move in board.move_stack:
+        san_moves += [new_board.san(move)]
+        new_board.push(move)
+
+    to_print = []
+
+    for i in range(len(san_moves)):
+        if i % 2 == 0:
+            to_print.append("%d." % (i / 2 + 1))
+        to_print.append(san_moves[i])
+
+    print(" ".join(to_print))
+
+
 class CircleBuffer(list):
     def __init__(self, max_size):
         super().__init__()
@@ -55,8 +73,8 @@ class CircleBuffer(list):
 
 class LearningEngine(MinimalEngine):
 
-    def __init__(self, *args, name=None, weights=None, weight_file="weights.json", projection_seed=0,
-                 temperature=1, buffer_size=100000, batch_size=10):
+    def __init__(self, *args, name=None, weights=None, weight_file="/Users/bert/Desktop/logs/weights.json",
+                 projection_seed=0, buffer_size=1000, batch_size=10, average_param=0.99):
         super().__init__(*args)
         self.name = name
 
@@ -64,10 +82,11 @@ class LearningEngine(MinimalEngine):
         self.projection = self.random_state.randn(395, 395)  # todo: make this more flexible
         self.offset = 2 * np.pi * self.random_state.rand(395)
 
-        self.temperature = temperature
-
         self.buffer = CircleBuffer(buffer_size)
         self.batch_size = batch_size
+
+        self.grad_magnitude = 1
+        self.average_param = average_param
 
         if weight_file:
             print("Loading weights from file")
@@ -146,8 +165,8 @@ class LearningEngine(MinimalEngine):
         return score
 
     def search(self, board, time_limit, ponder):
-
-        moves = list(board.legal_moves)
+        # returns a random choice among highest-scoring q values
+        moves = np.array(list(board.legal_moves))
 
         scores = np.zeros(len(moves))
 
@@ -156,26 +175,20 @@ class LearningEngine(MinimalEngine):
 
             scores[i] = self.action_score(board, move)
 
-        scores *= self.temperature
+        best_moves = moves[scores == scores.max()]
 
-        probs = np.exp(scores - scores.max())
-        probs /= np.sum(probs)
-
-        samples = np.random.multinomial(1, probs)
-        sampled_move = moves[np.min(np.argwhere(samples))]
-
-        return sampled_move
+        return np.random.choice(best_moves)
 
     def save_weights(self, filepath):
         weight_list = self.weights.tolist()
         with codecs.open(filepath, 'w', encoding='utf-8') as fopen:
             json.dump(weight_list, fopen)
 
-    def q_learn(self, reward, prev_board, prev_move, new_board, learning_rate=0.0001, discount=1.0):
+    def q_learn(self, reward, prev_board, prev_move, new_board, learning_rate=0.001, discount=0.8):
         # q(a, s) is estimate of discounted future reward after
         #       making move a from s
         # q(a, s) <- q(a, s) + learning_rate *
-        #                       (reward +  max_{a'} q(a', s') - q(a, s))
+        #                       (reward +  discount * max_{a'} q(a', s') - q(a, s))
 
         # store position in buffer
         prev_board.push(prev_move)
@@ -187,6 +200,9 @@ class LearningEngine(MinimalEngine):
             new_boards.append(self.features(new_board))
             new_board.pop()
         self.buffer.add_item((reward, prev_features, new_boards))
+
+        loss = 0
+        gradient = 0
 
         for _ in range(self.batch_size):
 
@@ -200,9 +216,23 @@ class LearningEngine(MinimalEngine):
                 max_future_score = max([self.weights.dot(features)
                                         for features in batch_new_boards])
 
-            # update weights
-            self.weights += learning_rate * (batch_reward + discount * max_future_score -
-                                             self.weights.dot(batch_prev_features)) * batch_prev_features
+            error = batch_reward + discount * max_future_score - self.weights.dot(batch_prev_features)
+
+            gradient -= error * batch_prev_features
+
+            loss += error ** 2
+
+        gradient /= self.batch_size
+
+        gradient = np.clip(gradient, -1, 1)
+
+        # uncomment this line to disable RMSProp
+        self.grad_magnitude = self.average_param * self.grad_magnitude + (1 - self.average_param) * gradient ** 2
+
+        # update weights
+        self.weights -= learning_rate * gradient / np.sqrt(self.grad_magnitude)
+
+        return loss / self.batch_size
 
 
 if __name__ == "__main__":
@@ -216,6 +246,7 @@ if __name__ == "__main__":
     writer = summary.create_file_writer(log_dir + time_string)
 
     step = 0
+    start_time = time.time()
 
     # Use this next line to load bot weights from disk
     #engine_white = LearningEngine(None, None, sys.stderr)
@@ -237,14 +268,19 @@ if __name__ == "__main__":
     losses = 0
     draws = 0
 
-    max_moves = 100
+    max_moves = 60
+    eps_reset = 0
 
     while True:
         # Occasionally update black to match white's weights
-        if (wins + losses + draws) % 5000 == 0:
+        if step % 5000 == 0:
             print("Updating black to match learned weights")
             engine_black.weights = engine_white.weights.copy()
-        
+            eps_reset = 0
+
+        queen_mate = '8/8/8/3Q4/8/3K4/8/4k3 w - - 2 2'  # mate in 2
+        # queen_mate = '8/8/8/2Q5/8/4K3/8/4k3 w - - 0 1'  # mate in 1
+        # smith_morra = 'rnbqkbnr/pp1ppppp/8/2p5/3PP3/8/PPP2PPP/RNBQKBNR b KQkq - 0 3'
         board = chess.Board()
 
         white_positions = []
@@ -253,9 +289,17 @@ if __name__ == "__main__":
         # play a single game
 
         while not board.outcome() and board.fullmove_number < max_moves:
+            # play a game
             if board.turn == chess.WHITE:
-                white_positions.append(board.copy())
-                move = engine_white.search(board, 1000, True)
+                white_positions.append(board.copy(stack=False))
+
+                epsilon = 1 / np.sqrt((step - eps_reset) / 10 + 100)
+
+                # use epsilon-greedy strategy
+                if np.random.rand() < epsilon:
+                    move = np.random.choice(list(board.legal_moves))
+                else:
+                    move = engine_white.search(board, 1000, True)
                 white_moves.append(move)
             else:
                 move = engine_black.search(board, 1000, True)
@@ -265,9 +309,11 @@ if __name__ == "__main__":
 
         # do learning on all steps of the game
 
-        outcome = board.outcome(claim_draw=True)
+        outcome = board.outcome()
 
         rewards = []
+
+        q_losses = []
 
         # do q-learning on each of white's moves
         for i in range(len(white_moves) - 1):
@@ -275,8 +321,9 @@ if __name__ == "__main__":
                      material_count(white_positions[i])
             rewards.append(reward)
 
-            engine_white.q_learn(reward, white_positions[i], white_moves[i],
-                                 white_positions[i + 1])
+            q_loss = engine_white.q_learn(reward, white_positions[i], white_moves[i],
+                                          white_positions[i + 1])
+            q_losses.append(q_loss)
 
         # final move
         if outcome and outcome.winner == chess.WHITE:
@@ -293,16 +340,15 @@ if __name__ == "__main__":
 
         episode_reward = np.sum(rewards)
 
-        engine_white.q_learn(reward, white_positions[-1], white_moves[-1],
-                             chess.Board('8/8/8/8/8/8/8/8 w - - 0 1'))
-
-        # clip weights
-        # engine_white.weights = engine_white.weights.clip(min=-25, max=25)
+        q_loss = engine_white.q_learn(reward, white_positions[-1], white_moves[-1],
+                                      chess.Board('8/8/8/8/8/8/8/8 w - - 0 1'))
+        q_losses.append(q_loss)
 
         # log diagnostic info
         with writer.as_default():
             summary.scalar('Reward', episode_reward, step)
             summary.scalar('Result', reward / 100, step)
+            summary.scalar('Average Loss', np.mean(q_losses), step)
             summary.scalar('P', engine_white.weights[0], step)
             summary.scalar('N', engine_white.weights[1], step)
             summary.scalar('B', engine_white.weights[2], step)
@@ -333,7 +379,12 @@ if __name__ == "__main__":
         print("Wins: {}. Losses: {}. Draws: {}. Win rate: {:.2f}, W/L: {:.2f}".format(
             wins, losses, draws, wins / (wins + losses + draws), wins / (losses + 1e-16)))
 
-        engine_white.save_weights("weights.json")
+        print_game(board)
+
+        engine_white.save_weights("/Users/bert/Desktop/logs/weights.json")
 
         step += 1
 
+        elapsed_time = time.time() - start_time
+
+        print("Played {} games ({:.2f} games/sec)".format(step, step / elapsed_time))

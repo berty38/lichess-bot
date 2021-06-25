@@ -5,6 +5,7 @@ import sys
 import math
 import time
 from LearningEngine import LearningEngine, CircleBuffer
+from LearningEngine import material_count as material_count_learner
 import numpy as np
 
 missing_rook_white = 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBN1 w Qkq - 0 1'
@@ -19,7 +20,12 @@ opening_error_flipped = 'r1bqkb1r/pppn1ppp/3Pp3/4n2Q/8/3B4/PPPP1PPP/RNB1K1NR b K
 imbalanced_material_white = 'r1b1k1nr/pppppppp/8/8/8/8/PPP1PPPP/1NBQKBN1 w kq - 0 1'
 imbalanced_material_black = 'r1b1k1nr/pppppppp/8/8/8/8/PPP1PPPP/1NBQKBN1 b kq - 0 1'
 
+modified_stafford = 'r1bqkb1r/pppp1ppp/2n2n2/4N3/4P3/8/PPPP1PPP/RN1QKB1R w KQkq - 0 1'
+reversed_mod_stafford = 'rn1qkb1r/pppp1ppp/8/4p3/4n3/2N2N2/PPPP1PPP/R1BQKB1R b KQkq - 0 1'
 
+giuoco_piano = 'r1bqk1nr/pppp1ppp/2n5/2b1p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4'
+
+queen_mate = '8/8/5Q2/2k5/4K3/8/8/8 w - - 0 1'
 
 class EngineTestCase(unittest.TestCase):
 
@@ -192,6 +198,108 @@ class EngineTestCase(unittest.TestCase):
 
         print(buffer)
         self.assertEqual(tuple(buffer), ('e', 'f', 'c', 'd'))
+
+    def test_board_mirroring(self):
+        engine = LearningEngine(None, None, sys.stderr, weight_file=None)
+
+        white_board = chess.Board(modified_stafford)
+        white_features = engine.features(white_board)
+
+        black_board = chess.Board(reversed_mod_stafford)
+        black_features = engine.features(black_board)
+
+        self.assertTrue(np.allclose(white_features, black_features))
+
+    def test_buffering(self):
+        engine = LearningEngine(None, None, sys.stderr, buffer_size=10, weight_file=None)
+
+        self.assertEquals(len(engine.buffer), 0)
+
+        board = chess.Board(opening_error)
+
+        # make move for white
+        moves = list(board.legal_moves)
+        move = moves.pop()
+
+        new_board = board.copy()
+        new_board.push(move)
+
+        # make move for black
+        moves = list(new_board.legal_moves)
+        black_move = moves.pop()
+
+        new_board.push(black_move)
+
+        engine.q_learn(0, board, move, new_board)
+
+        self.assertEquals(len(engine.buffer), 1)
+
+    def test_q_loss_reduction(self):
+        starting_board = chess.Board(giuoco_piano)
+
+        bad_line = ['Nxe5', 'Nxe5']
+        good_line = ['c3', 'Nf6']
+
+        bad_board = starting_board.copy()
+        bad_move = starting_board.parse_san(bad_line[0])
+
+        for san in bad_line:
+            bad_board.push(bad_board.parse_san(san))
+
+        bad_reward = material_count_learner(bad_board) - material_count(starting_board)
+
+        good_board = starting_board.copy()
+        good_move = starting_board.parse_san(good_line[0])
+
+        for san in good_line:
+            good_board.push(good_board.parse_san(san))
+
+        good_reward = material_count_learner(good_board) - material_count(starting_board)
+
+        print("Line {} leads to reward {}".format(bad_line, bad_reward))
+        print("Line {} leads to reward {}".format(good_line, good_reward))
+
+        engine = LearningEngine(None, None, sys.stderr, weights=None, weight_file=None)
+        engine.weights *= 0
+
+        init_bad_estimate = engine.action_score(starting_board, bad_move)
+        init_good_estimate = engine.action_score(starting_board, good_move)
+
+        print("Initial engine estimated reward of {} is {}".format(
+            bad_line[0], init_bad_estimate))
+        print("Initial engine estimated reward of {} is {}".format(
+            good_line[0], init_good_estimate))
+
+        losses = []
+
+        for _ in range(100):
+            bad_loss = engine.q_learn(bad_reward, starting_board, bad_move, bad_board)
+            good_loss = engine.q_learn(good_reward, starting_board, good_move, good_board)
+
+            losses.append(bad_loss + good_loss)
+
+        final_bad_estimate = engine.action_score(starting_board, bad_move)
+        final_good_estimate = engine.action_score(starting_board, good_move)
+
+        print("Final engine estimated reward of {} is {}".format(
+            bad_line[0], final_bad_estimate))
+        print("Final engine estimated reward of {} is {}".format(
+            good_line[0], final_good_estimate))
+
+        print("Losses: {}".format(losses))
+
+        self.assertLess(losses[-1], losses[0])
+        self.assertLess(losses[-1], 0.1)
+
+        init_error = np.abs(init_good_estimate - good_reward) + np.abs(init_bad_estimate - bad_reward)
+        final_error = np.abs(final_good_estimate - good_reward) + np.abs(final_bad_estimate - bad_reward)
+
+        self.assertLess(final_error, init_error)
+
+        # This only seems to work if we initialize to all zeros. Maybe because we don't have any base cases?
+
+    def test_mate_learn(self):
+        board = LearningEngine()
 
 
 if __name__ == '__main__':
