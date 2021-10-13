@@ -250,7 +250,7 @@ class ScoreEngine(MinimalEngine):
                 score = self.negamax_score(new_board, curr_depth=1, max_depth=depth,
                                            deadline=deadline,
                                            generate_children=self.get_all_moves,
-                                           evaluation_function=self.quiescence_search)
+                                           evaluation_function=material_count)
 
                 if score > best_score:
                     best_moves = [move]
