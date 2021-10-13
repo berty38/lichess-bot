@@ -7,6 +7,6 @@ requests>=2.25.1
 urllib3==1.26.4
 backoff==1.10.0
 tensorflow
-numpy
+numpy==1.19.2
 matplotlib
 torch

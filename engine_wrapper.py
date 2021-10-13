@@ -199,6 +199,8 @@ class XBoardEngine(EngineWrapper):
         if game.opponent.title == "BOT":
             self.engine.protocol.send_line("computer")
 
+
 def getHomemadeEngine():
-    from LearningEngine import LearningEngine
+    from LearningEngine import LearningEngine, TorchLearner
+    learner = TorchLearner(from_file="~/Desktop/latest_model")
     return LearningEngine

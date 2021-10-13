@@ -1,5 +1,5 @@
 from HangingEngine import HangingEngine
-from strategies import MinimalEngine
+from strategies import MinimalEngine, RandomMove
 import chess
 import numpy as np
 import random
@@ -12,6 +12,11 @@ from io import StringIO
 from datetime import datetime
 import tempfile
 import time
+from collections import deque
+
+import torch.nn as nn
+import torch.nn.functional as F
+import torch
 
 PIECE_VALUES = {
     chess.PAWN: 1,
@@ -61,20 +66,6 @@ def print_game(board, white_name, black_name):
     print(" ".join(to_print))
 
 
-class CircleBuffer(list):
-    def __init__(self, max_size):
-        super().__init__()
-        self.cursor = 0
-        self.max_size = max_size
-
-    def add_item(self, x):
-        if len(self) < self.max_size:
-            self.append(x)
-        else:
-            # print("Buffer is full")
-            self[self.cursor] = x
-            self.cursor = (self.cursor + 1) % self.max_size
-
 def features(board):
     """
     Returns a numpy vector describing the board position
@@ -119,16 +110,29 @@ def features(board):
     if board.is_checkmate():
         features[6] = 1
 
-    return np.concatenate(features, castling, piece_grid.ravel())
+    return np.concatenate((features, castling, piece_grid.ravel()))
 
 
 class TorchLearner:
-    def __init__(self, buffer_size=2500, batch_size=10):
-        self.buffer = CircleBuffer(buffer_size)
+    def __init__(self, buffer_size=2500, batch_size=10, from_file=None):
+        self.buffer = deque(maxlen=buffer_size)
         self.batch_size = batch_size
 
+        sample_vector = features(chess.Board())
+
+        self.model = nn.Sequential(
+            nn.Linear(sample_vector.size, 50),
+            nn.ReLU(),
+            nn.Linear(50, 1))
+        self.loss_fn = F.l1_loss
+
+        self.optimizer = torch.optim.SGD(self.model.parameters(), lr=0.01)
+
+        if from_file:
+            self.model.load_state_dict(torch.load(from_file))
+
     def score(self, board):
-        return 0
+        return self.model(torch.from_numpy(features(board).astype(np.float32)))
 
     def learn(self, reward, prev_board, prev_move, new_board):
         # q(a, s) is estimate of discounted future reward after
@@ -138,26 +142,66 @@ class TorchLearner:
 
         # store position in buffer
         prev_board.push(prev_move)
-        prev_features = self.features(prev_board)
+        prev_features = features(prev_board).astype(np.float32)
         prev_board.pop()
         new_boards = []
         for move in new_board.legal_moves:
             new_board.push(move)
-            new_boards.append(self.features(new_board))
+            new_boards.append(features(new_board).astype(np.float32))
             new_board.pop()
-        self.buffer.add_item((reward, prev_features, new_boards))
+        self.buffer.append((float(reward), prev_features, new_boards))
 
-        self._q_learn()
+        return self._q_learn()
 
     def _q_learn(self):
-        return
+        discount = 0.9
+
+        if len(self.buffer) < self.batch_size:
+            return 0
+
+        self.optimizer.zero_grad()
+
+        # sample a batch
+        batch = random.sample(self.buffer, min(len(self.buffer), self.batch_size))
+
+        rewards, prev_features, new_boards = zip(*batch)
+
+        rewards = torch.from_numpy(np.asarray(rewards))
+
+        prev_features = torch.from_numpy(np.asarray(prev_features))
+
+        new_boards = [torch.from_numpy(np.asarray(x)) for x in new_boards]
+
+        # todo: find a better way to do this than a loop
+        new_scores = []
+        for position_new_boards in new_boards:
+            if len(position_new_boards) > 0:
+                new_scores.append(torch.max(self.model(position_new_boards)).detach())
+            else:
+                new_scores.append(0)  # this should only happen in terminal states
+
+        new_scores = torch.FloatTensor(new_scores)
+        prev_scores = self.model(prev_features)
+
+        loss = self.loss_fn(prev_scores, rewards + discount * new_scores)
+
+        loss.backward()
+
+        self.optimizer.step()
+
+        return loss.data
 
 
 class LearningEngine(MinimalEngine):
 
-    def __init__(self, *args, name=None, learner=TorchLearner()):
+    def __init__(self, *args, name=None, learner=None):
+
+        if learner is None:
+            learner = TorchLearner(from_file="~/Desktop/latest_model")
+
         super().__init__(*args)
         self.name = name
+        self.learner = learner
 
     def action_score(self, board, move):
         # calculate score
@@ -200,8 +244,8 @@ if __name__ == "__main__":
     start_time = time.time()
 
     # Use this next line to load bot weights from disk
-    engine_white = LearningEngine(None, None, sys.stderr)
-    engine_black = HangingEngine(None, None, sys.stderr)
+    engine_learner = LearningEngine(None, None, sys.stderr, learner=TorchLearner())
+    engine_opponent = RandomMove(None, None, sys.stderr)
 
     wins = 0
     losses = 0
@@ -209,7 +253,7 @@ if __name__ == "__main__":
 
     max_moves = 60
     eps_reset = 0
-    black_id = 0
+    opponent_id = 0
 
     while True:
         board = chess.Board()
@@ -231,10 +275,10 @@ if __name__ == "__main__":
                 if np.random.rand() < epsilon:
                     move = np.random.choice(list(board.legal_moves))
                 else:
-                    move = engine_white.search(board, 1000, True)
+                    move = engine_learner.search(board, 1000, True)
                 learner_moves.append(move)
             else:
-                move = engine_black.search(board, 1000, True)
+                move = engine_opponent.search(board, 1000, True)
 
             #print(board.san(move))
             board.push(move)
@@ -250,8 +294,8 @@ if __name__ == "__main__":
                      material_count(learner_positions[i])
             rewards.append(reward)
 
-            q_loss = engine_white.learn(reward, learner_positions[i], learner_moves[i],
-                                        learner_positions[i + 1])
+            q_loss = engine_learner.learn(reward, learner_positions[i], learner_moves[i],
+                                          learner_positions[i + 1])
             q_losses.append(q_loss)
 
         # final move
@@ -269,8 +313,8 @@ if __name__ == "__main__":
 
         episode_reward = np.sum(rewards)
 
-        q_loss = engine_white.learn(reward, learner_positions[-1], learner_moves[-1],
-                                    chess.Board('8/8/8/8/8/8/8/8 w - - 0 1'))
+        q_loss = engine_learner.learn(reward, learner_positions[-1], learner_moves[-1],
+                                      chess.Board('8/8/8/8/8/8/8/8 w - - 0 1'))
         q_losses.append(q_loss)
 
         # log diagnostic info
@@ -280,13 +324,11 @@ if __name__ == "__main__":
             summary.scalar('Average Loss', np.mean(q_losses), step)
 
         # print diagnostic info
-        weights = engine_white.weights
-
         print("Wins: {}. Losses: {}. Draws: {}. Win rate: {:.2f}, W/L: {:.2f}".format(
             wins, losses, draws, wins / (wins + losses + draws), wins / (losses + 1e-16)))
 
         learner_name = "Learner{}".format(step)
-        opponent_name = "Learner{}".format(black_id)
+        opponent_name = "Learner{}".format(opponent_id)
 
         white_name = learner_name if learner_color == chess.WHITE else opponent_name
         black_name = learner_name if learner_color == chess.BLACK else opponent_name
@@ -297,3 +339,6 @@ if __name__ == "__main__":
         elapsed_time = time.time() - start_time
 
         print("Played {} games ({:.2f} games/sec)".format(step, step / elapsed_time))
+
+        if step % 100 == 0:
+            torch.save(engine_learner.learner.model.state_dict(), "~/Desktop/latest_model")
