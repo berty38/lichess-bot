@@ -18,6 +18,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch
 
+DEFAULT_MODEL_LOCATION = "/Users/bert/Desktop/latest_model"
+
 PIECE_VALUES = {
     chess.PAWN: 1,
     chess.KNIGHT: 3,
@@ -113,26 +115,38 @@ def features(board):
     return np.concatenate((features, castling, piece_grid.ravel()))
 
 
+class ResNet(nn.Module):
+    def __init__(self, d, layers):
+        super().__init__()
+        self.layers = nn.ModuleList([torch.nn.Linear(d, d) for _ in range(layers - 1)])
+        self.fc = torch.nn.Linear(d, 1)
+
+    def forward(self, x0):
+        x = x0
+        for layer in self.layers:
+            x = layer(x)
+            x = F.relu(x) + x0
+        return self.fc(x)
+
+
 class TorchLearner:
-    def __init__(self, buffer_size=2500, batch_size=10, from_file=None):
+    def __init__(self, buffer_size=10000, batch_size=5, from_file=None):
         self.buffer = deque(maxlen=buffer_size)
         self.batch_size = batch_size
 
         sample_vector = features(chess.Board())
 
-        self.model = nn.Sequential(
-            nn.Linear(sample_vector.size, 50),
-            nn.ReLU(),
-            nn.Linear(50, 1))
+        self.model = ResNet(sample_vector.size, 3)
         self.loss_fn = F.l1_loss
 
-        self.optimizer = torch.optim.SGD(self.model.parameters(), lr=0.01)
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=0.01)
 
         if from_file:
             self.model.load_state_dict(torch.load(from_file))
 
     def score(self, board):
-        return self.model(torch.from_numpy(features(board).astype(np.float32)))
+        with torch.no_grad():
+            return self.model(torch.from_numpy(features(board).astype(np.float32)))
 
     def learn(self, reward, prev_board, prev_move, new_board):
         # q(a, s) is estimate of discounted future reward after
@@ -189,6 +203,9 @@ class TorchLearner:
 
         self.optimizer.step()
 
+        for param in self.model.parameters():
+            param.grad.data.clamp_(-1, 1)
+
         return loss.data
 
 
@@ -197,7 +214,7 @@ class LearningEngine(MinimalEngine):
     def __init__(self, *args, name=None, learner=None):
 
         if learner is None:
-            learner = TorchLearner(from_file="~/Desktop/latest_model")
+            learner = TorchLearner(from_file=DEFAULT_MODEL_LOCATION)
 
         super().__init__(*args)
         self.name = name
@@ -322,6 +339,7 @@ if __name__ == "__main__":
             summary.scalar('Reward', episode_reward, step)
             summary.scalar('Result', reward / 100, step)
             summary.scalar('Average Loss', np.mean(q_losses), step)
+            summary.scalar('Win rate', wins / (wins + losses + draws), step)
 
         # print diagnostic info
         print("Wins: {}. Losses: {}. Draws: {}. Win rate: {:.2f}, W/L: {:.2f}".format(
@@ -340,5 +358,5 @@ if __name__ == "__main__":
 
         print("Played {} games ({:.2f} games/sec)".format(step, step / elapsed_time))
 
-        if step % 100 == 0:
-            torch.save(engine_learner.learner.model.state_dict(), "~/Desktop/latest_model")
+        if step % 50 == 0:
+            torch.save(engine_learner.learner.model.state_dict(), DEFAULT_MODEL_LOCATION)

@@ -202,5 +202,5 @@ class XBoardEngine(EngineWrapper):
 
 def getHomemadeEngine():
     from LearningEngine import LearningEngine, TorchLearner
-    learner = TorchLearner(from_file="~/Desktop/latest_model")
+    learner = TorchLearner(from_file="/Users/bert/Desktop/latest_model")
     return LearningEngine
