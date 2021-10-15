@@ -4,7 +4,7 @@ from custom_engine import ScoreEngine, material_count, tiebreakers
 import sys
 import math
 import time
-from LearningEngine import LearningEngine, CircleBuffer
+from LearningEngine import LearningEngine
 from LearningEngine import material_count as material_count_learner
 import numpy as np
 
