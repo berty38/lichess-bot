@@ -9,12 +9,14 @@ import chess
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+import torch.nn.functional as functional
 
 from HangingEngine import HangingEngine
 from strategies import MinimalEngine, RandomMove
 
 DEFAULT_MODEL_LOCATION = "/Users/bert/Desktop/latest_model"
+
+EVAL_INTERVAL = 50
 
 PIECE_VALUES = {
     chess.PAWN: 1,
@@ -64,7 +66,55 @@ def print_game(board, white_name, black_name):
     print(" ".join(to_print))
 
 
-def features(board):
+def play_game(a, b, board=None, print_pgn=False):
+    if not board:
+        board = chess.Board()
+    max_moves = 60
+    a_turn = random.getrandbits(1)  # random boolean
+    while not board.outcome(claim_draw=True) and board.fullmove_number < max_moves:
+
+        # play a game
+        if board.turn == a_turn:
+            move = a.search(board, 10000, True)
+        else:
+            move = b.search(board, 10000, True)
+
+        board.push(move)
+
+    outcome = board.outcome()
+
+    if print_pgn:
+        white = a if a_turn else b
+        black = b if a_turn else a
+        print_game(board, white.engine.id["name"], black.engine.id["name"])
+
+    if outcome and outcome.winner == a_turn:
+        return 1
+    elif outcome and outcome.winner == (not a_turn):
+        return -1
+    return 0
+
+
+def play_match(a, b, num_games):
+    """
+    Play a match between engine a and b
+    """
+    wins = 0
+    losses = 0
+    draws = 0
+    for _ in range(num_games):
+        result = play_game(a, b, print_pgn=True)
+        if result == -1:
+            losses += 1
+        elif result == 0:
+            draws += 1
+        elif result == 1:
+            wins += 1
+
+    return wins, losses, draws
+
+
+def get_features(board):
     """
     Returns a numpy vector describing the board position
     """
@@ -87,8 +137,6 @@ def features(board):
     }
 
     # add castling rights
-    cr = board.castling_rights
-
     castling = [board.has_kingside_castling_rights(chess.WHITE),
                 board.has_queenside_castling_rights(chess.WHITE),
                 board.has_kingside_castling_rights(chess.BLACK),
@@ -124,21 +172,22 @@ class Net(nn.Module):
         x = x0
         for layer in self.mid_layers:
             x = layer(x)
-            x = F.relu(x) + x0
+            x = functional.relu(x) + x0
         return self.fc(x)
 
 
 class TorchLearner:
-    def __init__(self, buffer_size=1000, batch_size=5, sync_interval=200, from_file=DEFAULT_MODEL_LOCATION):
+    def __init__(self, buffer_size=10000, batch_size=5, sync_interval=200, resnet_depth=2,
+                 from_file=DEFAULT_MODEL_LOCATION):
         self.buffer = deque(maxlen=buffer_size)
         self.batch_size = batch_size
         self.sync_interval = sync_interval
 
-        sample_vector = features(chess.Board())
+        sample_vector = get_features(chess.Board())
 
-        self.online_net = Net(sample_vector.size, 2)
-        self.target_net = Net(sample_vector.size, 2)
-        self.loss_fn = F.l1_loss
+        self.online_net = Net(sample_vector.size, resnet_depth)
+        self.target_net = Net(sample_vector.size, resnet_depth)
+        self.loss_fn = functional.l1_loss
 
         self.optimizer = torch.optim.Adam(self.online_net.parameters(), amsgrad=True)
 
@@ -150,7 +199,7 @@ class TorchLearner:
 
     def score(self, board):
         with torch.no_grad():
-            return self.online_net(torch.from_numpy(features(board).astype(np.float32)))
+            return self.online_net(torch.from_numpy(get_features(board).astype(np.float32)))
 
     def learn(self, reward, prev_board, prev_move, new_board):
         # q(a, s) is estimate of discounted future reward after
@@ -160,12 +209,12 @@ class TorchLearner:
 
         # store position in buffer
         prev_board.push(prev_move)
-        prev_features = features(prev_board).astype(np.float32)
+        prev_features = get_features(prev_board).astype(np.float32)
         prev_board.pop()
         new_boards = []
         for move in new_board.legal_moves:
             new_board.push(move)
-            new_boards.append(features(new_board).astype(np.float32))
+            new_boards.append(get_features(new_board).astype(np.float32))
             new_board.pop()
         self.buffer.append((float(reward), prev_features, new_boards))
 
@@ -265,11 +314,11 @@ class LearningEngine(MinimalEngine):
         return loss
 
 
-if __name__ == "__main__":
+def main():
     from tensorflow import summary
 
     time_string = datetime.now().strftime("%Y%m%d-%H%M%S")
-    note = "All_Opponents_Small_Buffer"
+    note = "All_Opponents_10000_buffer"
 
     # base_dir = tempfile.TemporaryDirectory().name
     base_dir = "/Users/bert/Desktop"
@@ -284,16 +333,11 @@ if __name__ == "__main__":
     # engine_learner = LearningEngine(None, None, sys.stderr, learner=TorchLearner(from_file=DEFAULT_MODEL_LOCATION))
     # use this one to re-initialize
     engine_learner = LearningEngine(None, None, sys.stderr, learner=TorchLearner(from_file=None))
-    engine_opponent = RandomMove(None, None, sys.stderr)
 
     opponent_learner = LearningEngine(None, "LearningEngine{}".format(step), sys.stderr,
                                       learner=copy.deepcopy(engine_learner.learner))
     opponent_random = RandomMove(None, None, sys.stderr)
     opponent_hanging = HangingEngine(None, None, sys.stderr)
-
-    wins = 0
-    losses = 0
-    draws = 0
 
     opponent_wins = np.zeros(3)
     opponent_losses = np.zeros(3)
@@ -301,7 +345,6 @@ if __name__ == "__main__":
 
     max_moves = 60
     eps_reset = 0
-    opponent_id = 0
 
     while True:
         # update engine name
@@ -316,12 +359,11 @@ if __name__ == "__main__":
         # choose opponent
         opponents = [opponent_random, opponent_hanging, opponent_learner]
         engine_opponent = random.choice(opponents)
-        #engine_opponent = opponent_random
+        # engine_opponent = opponent_learner
 
         opponent_index = opponents.index(engine_opponent)
 
         # play a single game
-
         while not board.outcome() and board.fullmove_number < max_moves:
             # play a game
             if board.turn == learner_color:
@@ -338,7 +380,7 @@ if __name__ == "__main__":
             else:
                 move = engine_opponent.search(board, 1000, True)
 
-            #print(board.san(move))
+            # print(board.san(move))
             board.push(move)
 
         # do learning on all steps of the game
@@ -359,15 +401,12 @@ if __name__ == "__main__":
         # final move
         if outcome and outcome.winner == learner_color:
             reward = 100
-            wins += 1
             opponent_wins[opponent_index] += 1
         elif outcome and outcome.winner == (not learner_color):
             reward = -100
-            losses += 1
             opponent_losses[opponent_index] += 1
         else:
             reward = 0
-            draws += 1
             opponent_draws[opponent_index] += 1
 
         rewards.append(reward)
@@ -379,29 +418,31 @@ if __name__ == "__main__":
         q_losses.append(q_loss)
 
         # log diagnostic info
+        if step % EVAL_INTERVAL == 0:
+            with writer.as_default():
+                num_games = 10
+                rand_wins, rand_losses, rand_ties = play_match(engine_learner, opponent_random, num_games)
+                learn_wins, learn_losses, learn_ties = play_match(engine_learner, opponent_learner, num_games)
+                hang_wins, hang_losses, hang_ties = play_match(engine_learner, opponent_hanging, num_games)
+
+                summary.scalar("Win Rate v. Random", rand_wins / num_games, step)
+                summary.scalar("Loss Rate v. Random", rand_losses / num_games, step)
+                summary.scalar("Win Rate v. Hanging", hang_wins / num_games, step)
+                summary.scalar("Loss Rate v. Hanging", hang_losses / num_games, step)
+                summary.scalar("Win Rate v. Learner", learn_wins / num_games, step)
+                summary.scalar("Loss Rate v. Learner", learn_losses / num_games, step)
+            print("Updating opponent to current model parameters")
+            # update opponent engine
+            opponent_learner = LearningEngine(None, "LearningEngine{}".format(step), sys.stderr,
+                                              learner=copy.deepcopy(engine_learner.learner))
+
+            opponent_learner.engine.id["name"] = "LearningEngine{}".format(step)
+
+            torch.save(engine_learner.learner.online_net.state_dict(), DEFAULT_MODEL_LOCATION)
+
         with writer.as_default():
-            summary.scalar('Reward', episode_reward, step)
-            summary.scalar('Result', reward / 100, step)
-            summary.scalar('Average Loss', np.mean(q_losses), step)
-            if step > 20:
-                summary.scalar('Win rate', wins / (wins + losses + draws), step)
-                summary.scalar('RandomMove Win rate', opponent_wins[0] / (opponent_wins[0] + opponent_losses[0] +
-                                                                          opponent_draws[0]), step)
-                summary.scalar('HangingEngine Win rate', opponent_wins[1] / (opponent_wins[1] + opponent_losses[1] +
-                                                                             opponent_draws[1]), step)
-                summary.scalar('LearningEngine Win rate', opponent_wins[2] / (opponent_wins[2] + opponent_losses[2] +
-                                                                              opponent_draws[2]), step)
-
-        # print diagnostic info
-        print("Wins: {}. Losses: {}. Draws: {}. Win rate: {:.2f}, W/L: {:.2f}".format(
-            wins, losses, draws, wins / (wins + losses + draws), wins / (losses + 1e-16)))
-
-        learner_name = engine_learner.engine.id["name"]
-        opponent_name = engine_opponent.engine.id["name"]
-
-        white_name = learner_name if learner_color == chess.WHITE else opponent_name
-        black_name = learner_name if learner_color == chess.BLACK else opponent_name
-        print_game(board, white_name, black_name)
+            summary.scalar("Reward", episode_reward, step)
+            summary.scalar("Avg Loss", np.mean(q_losses), step)
 
         step += 1
 
@@ -409,15 +450,6 @@ if __name__ == "__main__":
 
         print("Played {} games ({:.2f} games/sec)".format(step, step / elapsed_time))
 
-        if step % 50 == 0:
-            torch.save(engine_learner.learner.online_net.state_dict(), DEFAULT_MODEL_LOCATION)
 
-        if step % 500 == 0:
-            print("Updated opponent to current model parameters")
-            # update opponent engine
-            opponent_learner = LearningEngine(None, "LearningEngine{}".format(step), sys.stderr,
-                                              learner=copy.deepcopy(engine_learner.learner))
-
-            opponent_learner.engine.id["name"] = "LearningEngine{}".format(step)
-            opponent_id = step
-
+if __name__ == "__main__":
+    main()
