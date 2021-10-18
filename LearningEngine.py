@@ -114,6 +114,15 @@ def play_match(a, b, num_games):
     return wins, losses, draws
 
 
+def get_state_action_features(board, move):
+    current_features = get_features(board)
+    board.push(move)
+    next_features = get_features(board)
+    board.pop()
+
+    return np.concatenate((current_features, next_features))
+
+
 def get_features(board):
     """
     Returns a numpy vector describing the board position
@@ -163,21 +172,23 @@ def get_features(board):
 
 
 class Net(nn.Module):
-    def __init__(self, d, layers):
+    def __init__(self, d, hidden_size=100):
         super().__init__()
-        self.mid_layers = nn.ModuleList([torch.nn.Linear(d, d) for _ in range(layers - 1)])
-        self.fc = torch.nn.Linear(d, 1)
+        self.first = nn.Linear(d, hidden_size)
+        self.hidden_fc = nn.Linear(hidden_size, 1)
+        self.data_fc = nn.Linear(d, 1)
 
     def forward(self, x0):
-        x = x0
-        for layer in self.mid_layers:
-            x = layer(x)
-            x = functional.relu(x) + x0
-        return self.fc(x)
+        if x0.ndim == 1:
+            # convert to batch view
+            x0 = x0.view((1, -1))
+        h = self.first(x0)
+        h = functional.relu(h)
+        return self.hidden_fc(h) + self.data_fc(x0)
 
 
 class TorchLearner:
-    def __init__(self, buffer_size=10000, batch_size=5, sync_interval=200, resnet_depth=2,
+    def __init__(self, buffer_size=300, batch_size=50, sync_interval=100,
                  from_file=DEFAULT_MODEL_LOCATION):
         self.buffer = deque(maxlen=buffer_size)
         self.batch_size = batch_size
@@ -185,8 +196,8 @@ class TorchLearner:
 
         sample_vector = get_features(chess.Board())
 
-        self.online_net = Net(sample_vector.size, resnet_depth)
-        self.target_net = Net(sample_vector.size, resnet_depth)
+        self.online_net = Net(2 * sample_vector.size)
+        self.target_net = Net(2 * sample_vector.size)
         self.loss_fn = functional.l1_loss
 
         self.optimizer = torch.optim.Adam(self.online_net.parameters(), amsgrad=True)
@@ -197,9 +208,9 @@ class TorchLearner:
 
         self.update_count = 0
 
-    def score(self, board):
+    def score(self, board, move):
         with torch.no_grad():
-            return self.online_net(torch.from_numpy(get_features(board).astype(np.float32)))
+            return self.online_net(torch.from_numpy(get_state_action_features(board, move).astype(np.float32)))
 
     def learn(self, reward, prev_board, prev_move, new_board):
         # q(a, s) is estimate of discounted future reward after
@@ -208,14 +219,10 @@ class TorchLearner:
         #                       (reward +  discount * max_{a'} q(a', s') - q(a, s))
 
         # store position in buffer
-        prev_board.push(prev_move)
-        prev_features = get_features(prev_board).astype(np.float32)
-        prev_board.pop()
+        prev_features = get_state_action_features(prev_board, prev_move).astype(np.float32)
         new_boards = []
         for move in new_board.legal_moves:
-            new_board.push(move)
-            new_boards.append(get_features(new_board).astype(np.float32))
-            new_board.pop()
+            new_boards.append(get_state_action_features(new_board, move).astype(np.float32))
         self.buffer.append((float(reward), prev_features, new_boards))
 
         return self._q_learn()
@@ -266,9 +273,6 @@ class TorchLearner:
 
         self.optimizer.step()
 
-        for param in self.online_net.parameters():
-            param.grad.data.clamp_(-1, 1)
-
         self.update_count += 1
 
         if self.update_count % self.sync_interval == 0:
@@ -290,9 +294,7 @@ class LearningEngine(MinimalEngine):
 
     def action_score(self, board, move):
         # calculate score
-        board.push(move)
-        score = self.learner.score(board)
-        board.pop()
+        score = self.learner.score(board, move)
         return score
 
     def search(self, board, time_limit, ponder):
@@ -315,16 +317,16 @@ class LearningEngine(MinimalEngine):
 
 
 def main():
-    from tensorflow import summary
+    from torch.utils.tensorboard import SummaryWriter
 
     time_string = datetime.now().strftime("%Y%m%d-%H%M%S")
-    note = "All_Opponents_10000_buffer"
+    note = "All_Opponents_freeze_buffer"
 
     # base_dir = tempfile.TemporaryDirectory().name
     base_dir = "/Users/bert/Desktop"
     log_dir = '{}/logs/'.format(base_dir)
     print("Storing logs in {}".format(log_dir))
-    writer = summary.create_file_writer(log_dir + note + time_string)
+    writer = SummaryWriter(log_dir + note + time_string, flush_secs=1)
 
     step = 0
     start_time = time.time()
@@ -345,6 +347,12 @@ def main():
 
     max_moves = 60
     eps_reset = 0
+
+    sample_vector = get_features(chess.Board())
+
+    writer.add_graph(engine_learner.learner.online_net,
+                     torch.Tensor(np.concatenate((sample_vector, sample_vector))))
+    writer.flush()
 
     while True:
         # update engine name
@@ -419,18 +427,17 @@ def main():
 
         # log diagnostic info
         if step % EVAL_INTERVAL == 0:
-            with writer.as_default():
-                num_games = 10
-                rand_wins, rand_losses, rand_ties = play_match(engine_learner, opponent_random, num_games)
-                learn_wins, learn_losses, learn_ties = play_match(engine_learner, opponent_learner, num_games)
-                hang_wins, hang_losses, hang_ties = play_match(engine_learner, opponent_hanging, num_games)
+            num_games = 1
+            rand_wins, rand_losses, rand_ties = play_match(engine_learner, opponent_random, num_games)
+            learn_wins, learn_losses, learn_ties = play_match(engine_learner, opponent_learner, num_games)
+            hang_wins, hang_losses, hang_ties = play_match(engine_learner, opponent_hanging, num_games)
 
-                summary.scalar("Win Rate v. Random", rand_wins / num_games, step)
-                summary.scalar("Loss Rate v. Random", rand_losses / num_games, step)
-                summary.scalar("Win Rate v. Hanging", hang_wins / num_games, step)
-                summary.scalar("Loss Rate v. Hanging", hang_losses / num_games, step)
-                summary.scalar("Win Rate v. Learner", learn_wins / num_games, step)
-                summary.scalar("Loss Rate v. Learner", learn_losses / num_games, step)
+            writer.add_scalar("Win Rate v. Random", rand_wins / num_games, step)
+            writer.add_scalar("Loss Rate v. Random", rand_losses / num_games, step)
+            writer.add_scalar("Win Rate v. Hanging", hang_wins / num_games, step)
+            writer.add_scalar("Loss Rate v. Hanging", hang_losses / num_games, step)
+            writer.add_scalar("Win Rate v. Learner", learn_wins / num_games, step)
+            writer.add_scalar("Loss Rate v. Learner", learn_losses / num_games, step)
             print("Updating opponent to current model parameters")
             # update opponent engine
             opponent_learner = LearningEngine(None, "LearningEngine{}".format(step), sys.stderr,
@@ -440,9 +447,8 @@ def main():
 
             torch.save(engine_learner.learner.online_net.state_dict(), DEFAULT_MODEL_LOCATION)
 
-        with writer.as_default():
-            summary.scalar("Reward", episode_reward, step)
-            summary.scalar("Avg Loss", np.mean(q_losses), step)
+        writer.add_scalar("Reward", episode_reward, step)
+        writer.add_scalar("Avg Loss", np.mean(q_losses), step)
 
         step += 1
 
