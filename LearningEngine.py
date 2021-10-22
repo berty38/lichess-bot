@@ -115,12 +115,11 @@ def play_match(a, b, num_games):
 
 
 def get_state_action_features(board, move):
-    current_features = get_features(board)
     board.push(move)
     next_features = get_features(board)
     board.pop()
 
-    return np.concatenate((current_features, next_features))
+    return next_features
 
 
 def get_features(board):
@@ -172,23 +171,32 @@ def get_features(board):
 
 
 class Net(nn.Module):
-    def __init__(self, d, hidden_size=100):
+    def __init__(self, d):
         super().__init__()
+
+        hidden_size = 30
+
         self.first = nn.Linear(d, hidden_size)
         self.hidden_fc = nn.Linear(hidden_size, 1)
+        self.hidden1 = nn.Linear(hidden_size, hidden_size)
+        self.hidden2 = nn.Linear(hidden_size, hidden_size)
+        self.hidden3 = nn.Linear(hidden_size, hidden_size)
+        
         self.data_fc = nn.Linear(d, 1)
-
+        
     def forward(self, x0):
         if x0.ndim == 1:
             # convert to batch view
             x0 = x0.view((1, -1))
-        h = self.first(x0)
-        h = functional.relu(h)
-        return self.hidden_fc(h) + self.data_fc(x0)
+        h = functional.relu(self.first(x0))
+        h = functional.relu(self.hidden1(h))
+        h = functional.relu(self.hidden2(h))
+        h = functional.relu(self.hidden3(h))
+        return self.data_fc(x0) + self.hidden_fc(h)
 
 
 class TorchLearner:
-    def __init__(self, buffer_size=300, batch_size=50, sync_interval=100,
+    def __init__(self, buffer_size=5000, batch_size=10, sync_interval=1000,
                  from_file=DEFAULT_MODEL_LOCATION):
         self.buffer = deque(maxlen=buffer_size)
         self.batch_size = batch_size
@@ -196,8 +204,8 @@ class TorchLearner:
 
         sample_vector = get_features(chess.Board())
 
-        self.online_net = Net(2 * sample_vector.size)
-        self.target_net = Net(2 * sample_vector.size)
+        self.online_net = Net(sample_vector.size)
+        self.target_net = Net(sample_vector.size)
         self.loss_fn = functional.l1_loss
 
         self.optimizer = torch.optim.Adam(self.online_net.parameters(), amsgrad=True)
@@ -213,11 +221,6 @@ class TorchLearner:
             return self.online_net(torch.from_numpy(get_state_action_features(board, move).astype(np.float32)))
 
     def learn(self, reward, prev_board, prev_move, new_board):
-        # q(a, s) is estimate of discounted future reward after
-        #       making move a from s
-        # q(a, s) <- q(a, s) + learning_rate *
-        #                       (reward +  discount * max_{a'} q(a', s') - q(a, s))
-
         # store position in buffer
         prev_features = get_state_action_features(prev_board, prev_move).astype(np.float32)
         new_boards = []
@@ -225,7 +228,7 @@ class TorchLearner:
             new_boards.append(get_state_action_features(new_board, move).astype(np.float32))
         self.buffer.append((float(reward), prev_features, new_boards))
 
-        return self._q_learn()
+        return self._q_learn() if len(self.buffer) == self.buffer.maxlen else np.nan
 
     def _q_learn(self):
         discount = 0.9
@@ -265,7 +268,8 @@ class TorchLearner:
         new_scores = torch.FloatTensor(new_scores)
         prev_scores = self.online_net(prev_features)
 
-        loss = self.loss_fn(prev_scores.view(self.batch_size), rewards + discount * new_scores)
+        loss = self.loss_fn(prev_scores.view(self.batch_size),
+                            rewards + discount * new_scores)
 
         loss.backward()
 
@@ -320,7 +324,7 @@ def main():
     from torch.utils.tensorboard import SummaryWriter
 
     time_string = datetime.now().strftime("%Y%m%d-%H%M%S")
-    note = "All_Opponents_freeze_buffer"
+    note = "Only_Self_Warm_Start"
 
     # base_dir = tempfile.TemporaryDirectory().name
     base_dir = "/Users/bert/Desktop"
@@ -332,9 +336,9 @@ def main():
     start_time = time.time()
 
     # Use this next line to load bot weights from disk
-    # engine_learner = LearningEngine(None, None, sys.stderr, learner=TorchLearner(from_file=DEFAULT_MODEL_LOCATION))
+    engine_learner = LearningEngine(None, None, sys.stderr, learner=TorchLearner(from_file=DEFAULT_MODEL_LOCATION))
     # use this one to re-initialize
-    engine_learner = LearningEngine(None, None, sys.stderr, learner=TorchLearner(from_file=None))
+    # engine_learner = LearningEngine(None, None, sys.stderr, learner=TorchLearner(from_file=None))
 
     opponent_learner = LearningEngine(None, "LearningEngine{}".format(step), sys.stderr,
                                       learner=copy.deepcopy(engine_learner.learner))
@@ -351,8 +355,10 @@ def main():
     sample_vector = get_features(chess.Board())
 
     writer.add_graph(engine_learner.learner.online_net,
-                     torch.Tensor(np.concatenate((sample_vector, sample_vector))))
+                     torch.Tensor(sample_vector))
     writer.flush()
+
+    buffer_full = False
 
     while True:
         # update engine name
@@ -366,8 +372,8 @@ def main():
 
         # choose opponent
         opponents = [opponent_random, opponent_hanging, opponent_learner]
-        engine_opponent = random.choice(opponents)
-        # engine_opponent = opponent_learner
+        # engine_opponent = random.choice(opponents)
+        engine_opponent = opponent_learner
 
         opponent_index = opponents.index(engine_opponent)
 
@@ -396,10 +402,12 @@ def main():
         rewards = []
         q_losses = []
 
-        # do q-learning on each of white's moves
+        # do q-learning on each of learner's moves
         for i in range(len(learner_moves) - 1):
             reward = material_count(learner_positions[i + 1]) - \
                      material_count(learner_positions[i])
+            if learner_color == chess.BLACK:
+                reward = -reward
             rewards.append(reward)
 
             q_loss = engine_learner.learn(reward, learner_positions[i], learner_moves[i],
@@ -426,8 +434,10 @@ def main():
         q_losses.append(q_loss)
 
         # log diagnostic info
-        if step % EVAL_INTERVAL == 0:
-            num_games = 1
+        if step % EVAL_INTERVAL == 0 and \
+                engine_learner.learner.buffer.maxlen == len(engine_learner.learner.buffer):
+            buffer_full = True
+            num_games = 5
             rand_wins, rand_losses, rand_ties = play_match(engine_learner, opponent_random, num_games)
             learn_wins, learn_losses, learn_ties = play_match(engine_learner, opponent_learner, num_games)
             hang_wins, hang_losses, hang_ties = play_match(engine_learner, opponent_hanging, num_games)
@@ -455,6 +465,8 @@ def main():
         elapsed_time = time.time() - start_time
 
         print("Played {} games ({:.2f} games/sec)".format(step, step / elapsed_time))
+        if not buffer_full:
+            print("Buffer is {} full".format(len(engine_learner.learner.buffer) / engine_learner.learner.buffer.maxlen))
 
 
 if __name__ == "__main__":
