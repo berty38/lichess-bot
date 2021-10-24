@@ -17,6 +17,7 @@ from strategies import MinimalEngine, RandomMove
 DEFAULT_MODEL_LOCATION = "/Users/bert/Desktop/latest_model"
 
 EVAL_INTERVAL = 50
+OPPONENT_UPDATE_INTERVAL = 1000
 
 PIECE_VALUES = {
     chess.PAWN: 1,
@@ -25,6 +26,15 @@ PIECE_VALUES = {
     chess.ROOK: 5,
     chess.QUEEN: 9,
     chess.KING: 0,
+}
+
+PIECE_INDEX = {
+    chess.PAWN: 0,
+    chess.KNIGHT: 1,
+    chess.BISHOP: 2,
+    chess.ROOK: 3,
+    chess.QUEEN: 4,
+    chess.KING: 5
 }
 
 
@@ -69,7 +79,7 @@ def print_game(board, white_name, black_name):
 def play_game(a, b, board=None, print_pgn=False):
     if not board:
         board = chess.Board()
-    max_moves = 60
+    max_moves = 200
     a_turn = random.getrandbits(1)  # random boolean
     while not board.outcome(claim_draw=True) and board.fullmove_number < max_moves:
 
@@ -115,11 +125,19 @@ def play_match(a, b, num_games):
 
 
 def get_state_action_features(board, move):
-    board.push(move)
-    next_features = get_features(board)
-    board.pop()
+    board_features = get_features(board)
 
-    return next_features
+    promotion = np.zeros(4)
+    if move.promotion:
+        promotion[PIECE_INDEX[move.promotion] - 1] = 1
+
+    from_grid = np.zeros(64)
+    to_grid = np.zeros(64)
+
+    from_grid[move.from_square] = 1
+    to_grid[move.to_square] = 1
+
+    return np.concatenate((board_features, from_grid, to_grid, promotion))
 
 
 def get_features(board):
@@ -135,15 +153,6 @@ def get_features(board):
 
     features = np.zeros(7)
 
-    index = {
-        chess.PAWN: 0,
-        chess.KNIGHT: 1,
-        chess.BISHOP: 2,
-        chess.ROOK: 3,
-        chess.QUEEN: 4,
-        chess.KING: 5
-    }
-
     # add castling rights
     castling = [board.has_kingside_castling_rights(chess.WHITE),
                 board.has_queenside_castling_rights(chess.WHITE),
@@ -155,7 +164,7 @@ def get_features(board):
     for position, piece in all_pieces:
         value = -1 if piece.color == board.turn else 1
 
-        type_index = index[piece.piece_type]
+        type_index = PIECE_INDEX[piece.piece_type]
 
         features[type_index] += value
 
@@ -174,9 +183,13 @@ class Net(nn.Module):
     def __init__(self, d):
         super().__init__()
 
-        hidden_size = 30
+        hidden_size = 64
 
         self.first = nn.Linear(d, hidden_size)
+        self.bn1 = nn.BatchNorm1d(hidden_size)
+        self.bn2 = nn.BatchNorm1d(hidden_size)
+        self.bn3 = nn.BatchNorm1d(hidden_size)
+        self.bn_fc = nn.BatchNorm1d(hidden_size)
         self.hidden_fc = nn.Linear(hidden_size, 1)
         self.hidden1 = nn.Linear(hidden_size, hidden_size)
         self.hidden2 = nn.Linear(hidden_size, hidden_size)
@@ -202,10 +215,15 @@ class TorchLearner:
         self.batch_size = batch_size
         self.sync_interval = sync_interval
 
-        sample_vector = get_features(chess.Board())
+        blank_board = chess.Board()
+        e4 = chess.Move.from_uci("e2e4")
+
+        sample_vector = get_state_action_features(blank_board, e4)
 
         self.online_net = Net(sample_vector.size)
         self.target_net = Net(sample_vector.size)
+        self.online_net.eval()
+        self.target_net.eval()
         self.loss_fn = functional.l1_loss
 
         self.optimizer = torch.optim.Adam(self.online_net.parameters(), amsgrad=True)
@@ -217,6 +235,7 @@ class TorchLearner:
         self.update_count = 0
 
     def score(self, board, move):
+        self.online_net.eval()
         with torch.no_grad():
             return self.online_net(torch.from_numpy(get_state_action_features(board, move).astype(np.float32)))
 
@@ -266,6 +285,7 @@ class TorchLearner:
                 new_scores.append(0)  # this should only happen in terminal states
 
         new_scores = torch.FloatTensor(new_scores)
+        self.online_net.train()
         prev_scores = self.online_net(prev_features)
 
         loss = self.loss_fn(prev_scores.view(self.batch_size),
@@ -276,6 +296,8 @@ class TorchLearner:
         torch.nn.utils.clip_grad_norm_(self.online_net.parameters(), 1)
 
         self.optimizer.step()
+        
+        self.online_net.eval()
 
         self.update_count += 1
 
@@ -324,7 +346,7 @@ def main():
     from torch.utils.tensorboard import SummaryWriter
 
     time_string = datetime.now().strftime("%Y%m%d-%H%M%S")
-    note = "Only_Self_Warm_Start"
+    note = "Long_Games_Material_Cancelled"
 
     # base_dir = tempfile.TemporaryDirectory().name
     base_dir = "/Users/bert/Desktop"
@@ -336,9 +358,9 @@ def main():
     start_time = time.time()
 
     # Use this next line to load bot weights from disk
-    engine_learner = LearningEngine(None, None, sys.stderr, learner=TorchLearner(from_file=DEFAULT_MODEL_LOCATION))
+    # engine_learner = LearningEngine(None, None, sys.stderr, learner=TorchLearner(from_file=DEFAULT_MODEL_LOCATION))
     # use this one to re-initialize
-    # engine_learner = LearningEngine(None, None, sys.stderr, learner=TorchLearner(from_file=None))
+    engine_learner = LearningEngine(None, None, sys.stderr, learner=TorchLearner(from_file=None))
 
     opponent_learner = LearningEngine(None, "LearningEngine{}".format(step), sys.stderr,
                                       learner=copy.deepcopy(engine_learner.learner))
@@ -349,10 +371,15 @@ def main():
     opponent_losses = np.zeros(3)
     opponent_draws = np.zeros(3)
 
-    max_moves = 60
+    result_log = deque(maxlen=OPPONENT_UPDATE_INTERVAL)
+
+    max_moves = 1000
     eps_reset = 0
 
-    sample_vector = get_features(chess.Board())
+    blank_board = chess.Board()
+    e4 = chess.Move.from_uci("e2e4")
+
+    sample_vector = get_state_action_features(blank_board, e4)
 
     writer.add_graph(engine_learner.learner.online_net,
                      torch.Tensor(sample_vector))
@@ -406,8 +433,6 @@ def main():
         for i in range(len(learner_moves) - 1):
             reward = material_count(learner_positions[i + 1]) - \
                      material_count(learner_positions[i])
-            if learner_color == chess.BLACK:
-                reward = -reward
             rewards.append(reward)
 
             q_loss = engine_learner.learn(reward, learner_positions[i], learner_moves[i],
@@ -416,14 +441,17 @@ def main():
 
         # final move
         if outcome and outcome.winner == learner_color:
-            reward = 100
+            reward = 100 - sum(rewards)
             opponent_wins[opponent_index] += 1
+            result_log.append(1)
         elif outcome and outcome.winner == (not learner_color):
-            reward = -100
+            reward = - 100 - sum(rewards)
             opponent_losses[opponent_index] += 1
+            result_log.append(-1)
         else:
-            reward = 0
+            reward = -sum(rewards)
             opponent_draws[opponent_index] += 1
+            result_log.append(0)
 
         rewards.append(reward)
 
@@ -433,10 +461,10 @@ def main():
                                       chess.Board('8/8/8/8/8/8/8/8 w - - 0 1'))
         q_losses.append(q_loss)
 
+        buffer_full = engine_learner.learner.buffer.maxlen == len(engine_learner.learner.buffer)
+
         # log diagnostic info
-        if step % EVAL_INTERVAL == 0 and \
-                engine_learner.learner.buffer.maxlen == len(engine_learner.learner.buffer):
-            buffer_full = True
+        if step % EVAL_INTERVAL == 0 and buffer_full:
             num_games = 5
             rand_wins, rand_losses, rand_ties = play_match(engine_learner, opponent_random, num_games)
             learn_wins, learn_losses, learn_ties = play_match(engine_learner, opponent_learner, num_games)
@@ -449,16 +477,19 @@ def main():
             writer.add_scalar("Win Rate v. Learner", learn_wins / num_games, step)
             writer.add_scalar("Loss Rate v. Learner", learn_losses / num_games, step)
             print("Updating opponent to current model parameters")
+            torch.save(engine_learner.learner.online_net.state_dict(), DEFAULT_MODEL_LOCATION)
+
+        writer.add_scalar("Reward", episode_reward, step)
+
+        if buffer_full:
+            writer.add_scalar("Avg Loss", np.mean(q_losses), step)
+
+        if step > 1 and step % OPPONENT_UPDATE_INTERVAL == 0 and np.mean(result_log) > 0.5:
             # update opponent engine
             opponent_learner = LearningEngine(None, "LearningEngine{}".format(step), sys.stderr,
                                               learner=copy.deepcopy(engine_learner.learner))
 
             opponent_learner.engine.id["name"] = "LearningEngine{}".format(step)
-
-            torch.save(engine_learner.learner.online_net.state_dict(), DEFAULT_MODEL_LOCATION)
-
-        writer.add_scalar("Reward", episode_reward, step)
-        writer.add_scalar("Avg Loss", np.mean(q_losses), step)
 
         step += 1
 
