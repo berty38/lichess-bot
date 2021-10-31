@@ -125,19 +125,13 @@ def play_match(a, b, num_games):
 
 
 def get_state_action_features(board, move):
+    old_count = material_count(board)
+    board.push(move)
     board_features = get_features(board)
+    new_count = material_count(board)
+    board.pop()
 
-    promotion = np.zeros(4)
-    if move.promotion:
-        promotion[PIECE_INDEX[move.promotion] - 1] = 1
-
-    from_grid = np.zeros(64)
-    to_grid = np.zeros(64)
-
-    from_grid[move.from_square] = 1
-    to_grid[move.to_square] = 1
-
-    return np.concatenate((board_features, from_grid, to_grid, promotion))
+    return np.concatenate((board_features, np.array((old_count, new_count))))
 
 
 def get_features(board):
@@ -151,7 +145,7 @@ def get_features(board):
 
     all_pieces = board.piece_map().items()
 
-    features = np.zeros(7)
+    piece_count = np.zeros(7)
 
     # add castling rights
     castling = [board.has_kingside_castling_rights(chess.WHITE),
@@ -166,7 +160,7 @@ def get_features(board):
 
         type_index = PIECE_INDEX[piece.piece_type]
 
-        features[type_index] += value
+        piece_count[type_index] += value
 
         if piece.color != board.turn:
             type_index += 6
@@ -174,42 +168,37 @@ def get_features(board):
         piece_grid[position, type_index] = 1
 
     if board.is_checkmate():
-        features[6] = 1
+        piece_count[6] = 1
 
-    return np.concatenate((features, castling, piece_grid.ravel()))
+    return np.concatenate((piece_count, castling, piece_grid.ravel()))
 
 
 class Net(nn.Module):
-    def __init__(self, d):
+    def __init__(self, d, depth=2, hidden_size=256):
         super().__init__()
 
-        hidden_size = 64
-
         self.first = nn.Linear(d, hidden_size)
-        self.bn1 = nn.BatchNorm1d(hidden_size)
-        self.bn2 = nn.BatchNorm1d(hidden_size)
-        self.bn3 = nn.BatchNorm1d(hidden_size)
-        self.bn_fc = nn.BatchNorm1d(hidden_size)
         self.hidden_fc = nn.Linear(hidden_size, 1)
-        self.hidden1 = nn.Linear(hidden_size, hidden_size)
-        self.hidden2 = nn.Linear(hidden_size, hidden_size)
-        self.hidden3 = nn.Linear(hidden_size, hidden_size)
-        
         self.data_fc = nn.Linear(d, 1)
-        
+
+        hidden_layers = []
+        for _ in range(depth):
+            hidden_layers.append(nn.Linear(hidden_size, hidden_size))
+
+        self.hidden_layers = nn.ModuleList(hidden_layers)
+
     def forward(self, x0):
         if x0.ndim == 1:
             # convert to batch view
             x0 = x0.view((1, -1))
         h = functional.relu(self.first(x0))
-        h = functional.relu(self.hidden1(h))
-        h = functional.relu(self.hidden2(h))
-        h = functional.relu(self.hidden3(h))
-        return self.data_fc(x0) + self.hidden_fc(h)
+        for layer in self.hidden_layers:
+            h = functional.relu(layer(h))
+        return self.hidden_fc(h) + self.data_fc(x0)
 
 
 class TorchLearner:
-    def __init__(self, buffer_size=5000, batch_size=10, sync_interval=1000,
+    def __init__(self, buffer_size=25000, batch_size=10, sync_interval=1000,
                  from_file=DEFAULT_MODEL_LOCATION):
         self.buffer = deque(maxlen=buffer_size)
         self.batch_size = batch_size
@@ -220,13 +209,13 @@ class TorchLearner:
 
         sample_vector = get_state_action_features(blank_board, e4)
 
-        self.online_net = Net(sample_vector.size)
-        self.target_net = Net(sample_vector.size)
+        self.online_net = torch.jit.script(Net(sample_vector.size))
+        self.target_net = torch.jit.script(Net(sample_vector.size))
         self.online_net.eval()
         self.target_net.eval()
-        self.loss_fn = functional.l1_loss
+        self.loss_fn = functional.huber_loss
 
-        self.optimizer = torch.optim.Adam(self.online_net.parameters(), amsgrad=True)
+        self.optimizer = torch.optim.Adam(self.online_net.parameters())
 
         if from_file:
             self.online_net.load_state_dict(torch.load(from_file))
@@ -245,6 +234,7 @@ class TorchLearner:
         new_boards = []
         for move in new_board.legal_moves:
             new_boards.append(get_state_action_features(new_board, move).astype(np.float32))
+        # if len(self.buffer) < self.buffer.maxlen:
         self.buffer.append((float(reward), prev_features, new_boards))
 
         return self._q_learn() if len(self.buffer) == self.buffer.maxlen else np.nan
@@ -346,7 +336,7 @@ def main():
     from torch.utils.tensorboard import SummaryWriter
 
     time_string = datetime.now().strftime("%Y%m%d-%H%M%S")
-    note = "Long_Games_Material_Cancelled"
+    note = "Strongest_Opponent"
 
     # base_dir = tempfile.TemporaryDirectory().name
     base_dir = "/Users/bert/Desktop"
@@ -387,6 +377,10 @@ def main():
 
     buffer_full = False
 
+    hang_score = 0
+    learn_score = 0.5
+    rand_score = 0.5
+
     while True:
         # update engine name
         engine_learner.engine.id["name"] = "LearningEngine{}".format(step)
@@ -399,10 +393,12 @@ def main():
 
         # choose opponent
         opponents = [opponent_random, opponent_hanging, opponent_learner]
-        # engine_opponent = random.choice(opponents)
-        engine_opponent = opponent_learner
+        # choose opponent that we are worst against
+        opponent_scores = [rand_score, hang_score, learn_score]
 
-        opponent_index = opponents.index(engine_opponent)
+        opponent_index = opponent_scores.index(min(opponent_scores))
+
+        engine_opponent = opponents[opponent_index]
 
         # play a single game
         while not board.outcome() and board.fullmove_number < max_moves:
@@ -449,7 +445,7 @@ def main():
             opponent_losses[opponent_index] += 1
             result_log.append(-1)
         else:
-            reward = -sum(rewards)
+            reward = 0  # -sum(rewards)
             opponent_draws[opponent_index] += 1
             result_log.append(0)
 
@@ -470,13 +466,19 @@ def main():
             learn_wins, learn_losses, learn_ties = play_match(engine_learner, opponent_learner, num_games)
             hang_wins, hang_losses, hang_ties = play_match(engine_learner, opponent_hanging, num_games)
 
+            rand_score = rand_wins + 0.5 * rand_ties
+            learn_score = learn_wins + 0.5 * learn_ties
+            hang_score = hang_wins + 0.5 * hang_ties
+
             writer.add_scalar("Win Rate v. Random", rand_wins / num_games, step)
             writer.add_scalar("Loss Rate v. Random", rand_losses / num_games, step)
             writer.add_scalar("Win Rate v. Hanging", hang_wins / num_games, step)
             writer.add_scalar("Loss Rate v. Hanging", hang_losses / num_games, step)
             writer.add_scalar("Win Rate v. Learner", learn_wins / num_games, step)
             writer.add_scalar("Loss Rate v. Learner", learn_losses / num_games, step)
-            print("Updating opponent to current model parameters")
+            writer.add_scalar("Score v. Learner", learn_score, step)
+            writer.add_scalar("Score v. Hanging", hang_score, step)
+            writer.add_scalar("Score v. Random", rand_score, step)
             torch.save(engine_learner.learner.online_net.state_dict(), DEFAULT_MODEL_LOCATION)
 
         writer.add_scalar("Reward", episode_reward, step)
@@ -485,6 +487,7 @@ def main():
             writer.add_scalar("Avg Loss", np.mean(q_losses), step)
 
         if step > 1 and step % OPPONENT_UPDATE_INTERVAL == 0 and np.mean(result_log) > 0.5:
+            print("Updating opponent to current model parameters")
             # update opponent engine
             opponent_learner = LearningEngine(None, "LearningEngine{}".format(step), sys.stderr,
                                               learner=copy.deepcopy(engine_learner.learner))
