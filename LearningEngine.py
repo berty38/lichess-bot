@@ -17,7 +17,7 @@ from strategies import MinimalEngine, RandomMove
 DEFAULT_MODEL_LOCATION = "/Users/bert/Desktop/latest_model"
 
 EVAL_INTERVAL = 50
-OPPONENT_UPDATE_INTERVAL = 1000
+OPPONENT_UPDATE_INTERVAL = 50
 
 PIECE_VALUES = {
     chess.PAWN: 1,
@@ -170,23 +170,24 @@ def get_features(board):
 
         piece_grid[position, type_index] = 1
 
-    if board.is_checkmate():
-        piece_count[6] = 1
+    # if board.is_checkmate():
+        # piece_count[6] = 1
+    piece_count[6] = -material_count(board) / 100
 
     return np.concatenate((piece_count, castling, piece_grid.ravel()))
 
 
 class Net(nn.Module):
-    def __init__(self, d, depth=1, hidden_size=256):
+    def __init__(self, d, hidden_sizes=[512, 256, 128, 64, 32, 16]):
         super().__init__()
 
-        self.first = nn.Linear(d, hidden_size)
-        self.hidden_fc = nn.Linear(hidden_size, 1)
+        self.first = nn.Linear(d, hidden_sizes[0])
+        self.hidden_fc = nn.Linear(hidden_sizes[-1], 1)
         self.data_fc = nn.Linear(d, 1)
 
         hidden_layers = []
-        for _ in range(depth):
-            hidden_layers.append(nn.Linear(hidden_size, hidden_size))
+        for i in range(len(hidden_sizes) - 1):
+            hidden_layers.append(nn.Linear(hidden_sizes[i], hidden_sizes[i + 1]))
 
         self.hidden_layers = nn.ModuleList(hidden_layers)
 
@@ -201,7 +202,7 @@ class Net(nn.Module):
 
 
 class TorchLearner:
-    def __init__(self, buffer_size=25000, batch_size=5, sync_interval=1000,
+    def __init__(self, buffer_size=10000, batch_size=5, sync_interval=1000,
                  from_file=DEFAULT_MODEL_LOCATION):
         self.buffer = deque(maxlen=buffer_size)
         self.batch_size = batch_size
@@ -218,7 +219,9 @@ class TorchLearner:
         self.target_net.eval()
         self.loss_fn = functional.huber_loss
 
-        self.optimizer = torch.optim.Adam(self.online_net.parameters())
+        self.optimizer = torch.optim.SGD(self.online_net.parameters(), lr=0.01)
+
+        self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, verbose=True, patience=50)
 
         if from_file:
             self.online_net.load_state_dict(torch.load(from_file))
@@ -240,7 +243,7 @@ class TorchLearner:
         # if len(self.buffer) < self.buffer.maxlen:
         self.buffer.append((float(reward), prev_features, new_boards))
 
-        return self._q_learn() if len(self.buffer) == self.buffer.maxlen else np.nan
+        return self._q_learn()  # if len(self.buffer) == self.buffer.maxlen else np.nan
 
     def _q_learn(self):
         discount = 0.9
@@ -265,16 +268,17 @@ class TorchLearner:
         new_scores = []
         for position_new_boards in new_boards:
             if len(position_new_boards) > 0:
-                # with torch.no_grad():
-                #     # get best action
-                #     next_scores = self.online_net(position_new_boards)
-                #     best_index = torch.argmax(next_scores)
-                #
-                #     # compute target
-                #     new_score = self.target_net(position_new_boards[best_index])
+                with torch.no_grad():
+                    # get best action
+                    next_scores = self.online_net(position_new_boards)
+                    best_index = torch.argmax(next_scores)
 
-                next_scores = self.online_net(position_new_boards)
-                new_score = torch.max(next_scores)
+                    # compute target
+                    new_score = self.target_net(position_new_boards[best_index])
+
+                # standard q-learning
+                # next_scores = self.online_net(position_new_boards)
+                # new_score = torch.max(next_scores)
 
                 new_scores.append(new_score)
             else:
@@ -329,7 +333,9 @@ class LearningEngine(MinimalEngine):
             # apply the current candidate move
             scores[i] = self.action_score(board, move)
 
-        best_moves = moves[scores == scores.max()]
+        # consider scores within 0.25 of max to be equivalent
+
+        best_moves = moves[scores.max() - scores < 0.1]
 
         return np.random.choice(best_moves)
 
@@ -342,7 +348,7 @@ def main():
     from torch.utils.tensorboard import SummaryWriter
 
     time_string = datetime.now().strftime("%Y%m%d-%H%M%S")
-    note = "Minimax_Q_learning"
+    note = "Minimax_Q_learning_512_SGD"
 
     # base_dir = tempfile.TemporaryDirectory().name
     base_dir = "/Users/bert/Desktop"
@@ -386,6 +392,7 @@ def main():
     hang_score = 0
     learn_score = 0.5
     rand_score = 0.5
+    q_loss_record = deque(maxlen=1000)
 
     while True:
         # update engine name
@@ -466,7 +473,7 @@ def main():
         buffer_full = engine_learner.learner.buffer.maxlen == len(engine_learner.learner.buffer)
 
         # log diagnostic info
-        if step % EVAL_INTERVAL == 0 and buffer_full:
+        if step % EVAL_INTERVAL == 0:
             num_games = 5
             rand_wins, rand_losses, rand_ties = play_match(engine_learner, opponent_random, num_games)
             learn_wins, learn_losses, learn_ties = play_match(engine_learner, opponent_learner, num_games)
@@ -490,10 +497,15 @@ def main():
         writer.add_scalar("Reward", learner_reward, step)
         writer.add_scalar("Training Result", result_log[-1], step)
 
-        if buffer_full:
-            writer.add_scalar("Avg Loss", np.mean(q_losses), step)
+        # if buffer_full:
+        writer.add_scalar("Avg Loss", np.mean(q_losses), step)
 
-        if step > 1 and step % OPPONENT_UPDATE_INTERVAL == 0 and np.mean(result_log) > 0.0:
+        q_loss_record.append(np.mean(q_losses))
+
+        # if step > 1000:
+            # engine_learner.learner.scheduler.step(np.mean(q_loss_record))
+
+        if step > 1 and step % OPPONENT_UPDATE_INTERVAL == 0 and np.mean(result_log) > 0.25:
             print("Updating opponent to current model parameters")
             # update opponent engine
             opponent_learner = LearningEngine(None, "LearningEngine{}".format(step), sys.stderr,
