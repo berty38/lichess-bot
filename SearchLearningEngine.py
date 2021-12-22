@@ -27,16 +27,16 @@ random.seed(0)
 np.random.seed(0)
 
 EVAL_INTERVAL = 10
-TARGET_UPDATE = 1000000000
+TARGET_UPDATE = 1000
 BATCH_SIZE = 10
 MAX_MOVES = 200
 BUFFER_MAX_SIZE = 1000000
-EPOCHS = 1
-NUM_GAMES = 10
-MAX_BUFFER_ROUNDS = 50
+EPOCHS = 10
+NUM_GAMES = 1
+MAX_BUFFER_ROUNDS = 20
 LR = 1e-4
 
-# STARTING_POSITION = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"  # standard
+STARTING_POSITION = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"  # standard
 # STARTING_POSITION = "7r/8/4k3/8/8/4K3/8/R7 w - - 0 1"  # King and rook vs king and rook
 # STARTING_POSITION = "4k3/4q3/8/8/8/8/3Q4/3K4 w - - 0 1"  # King and queen vs king and queen
 # STARTING_POSITION = "4k3/4q3/8/8/8/8/8/3K4 w - - 0 1"  # King and queen vs king
@@ -45,7 +45,7 @@ LR = 1e-4
 # STARTING_POSITION = "Q6k/3ppppp/8/3q4/8/8/1P6/KR6 b - - 0 1"  # only legal move is mate
 # STARTING_POSITION = "Q6k/4pppp/8/3q4/8/8/1P6/KR6 b - - 0 1"  # 1 legal move is mate, other is loss
 # STARTING_POSITION = "8/3k4/4n3/8/8/8/2N5/1K6 w - - 0 1"  # King and knight each, no mate possible
-STARTING_POSITION = "1n2k1n1/8/8/8/8/8/8/1N2K1N1 w - - 0 1"  # King and 2 knights each. No mates possible
+# STARTING_POSITION = "1n2k1n1/8/8/8/8/8/8/1N2K1N1 w - - 0 1"  # King and 2 knights each. No mates possible
 
 
 def batchify(data: list, batch_size: int):
@@ -410,7 +410,8 @@ def main():
 
             features = torch.from_numpy(np.asarray(features, dtype=np.float32))
             next_features = [torch.from_numpy(np.asarray(x, dtype=np.float32)) for x in next_features]
-            next_non_terminal = [torch.from_numpy(np.asarray(x, dtype=np.float32)) for x in next_non_terminal]
+            next_non_terminal = [torch.from_numpy(np.asarray(x, dtype=np.float32)).view((-1, 1))
+                                 for x in next_non_terminal]
 
             current_scores = material + model(features)
 
@@ -495,6 +496,7 @@ def main():
         
         print("Completed {} epochs ({:.2f} rounds/sec). Loss {}".format(step, step / elapsed_time,
                                                                         loss_record / len(buffer)))
+        writer.flush()
 
 
 if __name__ == "__main__":
