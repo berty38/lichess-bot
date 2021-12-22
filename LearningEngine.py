@@ -4,6 +4,7 @@ import sys
 import time
 from collections import deque
 from datetime import datetime
+import tempfile
 
 import chess
 import numpy as np
@@ -18,6 +19,7 @@ DEFAULT_MODEL_LOCATION = "/Users/bert/Desktop/latest_model"
 
 EVAL_INTERVAL = 50
 OPPONENT_UPDATE_INTERVAL = 50
+NUM_STEPS = 500
 
 PIECE_VALUES = {
     chess.PAWN: 1,
@@ -41,12 +43,15 @@ PIECE_INDEX = {
 def material_count(new_board):
     # count material in the new position for player to move
 
-    if new_board.is_checkmate():
-        return -100
-
     all_pieces = new_board.piece_map().values()
 
     material_difference = 0
+
+    if new_board.is_checkmate():
+        if new_board.outcome().winner == new_board.turn:
+            material_difference += 100
+        else:
+            material_difference -= 100
 
     for piece in all_pieces:
         value = PIECE_VALUES[piece.piece_type]
@@ -58,28 +63,29 @@ def material_count(new_board):
     return material_difference
 
 
+def get_reward(board, next_board):
+    return -material_count(next_board) - material_count(board)
+
+
 def print_game(board, white_name, black_name):
-
-    print('[White "{}"]'.format(white_name))
-    print('[Black "{}"]'.format(black_name))
-
-    new_board = chess.Board()
+    to_print = list()
+    to_print.append(f'[FEN "{board.starting_fen}"]\n[White "{white_name}"]\n[Black "{black_name}"]\n')
+    
+    new_board = chess.Board(board.starting_fen)
     san_moves = []
     for move in board.move_stack:
         san_moves += [new_board.san(move)]
         new_board.push(move)
-
-    to_print = []
 
     for i in range(len(san_moves)):
         if i % 2 == 0:
             to_print.append("%d." % (i / 2 + 1))
         to_print.append(san_moves[i])
 
-    print(" ".join(to_print))
+    return " ".join(to_print)
 
 
-def play_game(a, b, board=None, print_pgn=False):
+def play_game(a, b, board=None, print_pgn=False, writer=None, step=None):
     if not board:
         board = chess.Board()
     max_moves = 200
@@ -99,32 +105,49 @@ def play_game(a, b, board=None, print_pgn=False):
     if print_pgn:
         white = a if a_turn else b
         black = b if a_turn else a
-        print_game(board, white.engine.id["name"], black.engine.id["name"])
+        pgn = print_game(board, white.engine.id["name"], black.engine.id["name"])
+
+        if writer:
+            writer.add_text("PGN", pgn, step)
+        else:
+            print(pgn)
 
     if outcome and outcome.winner == a_turn:
-        return 1
+        return 1, board, a_turn
     elif outcome and outcome.winner == (not a_turn):
-        return -1
-    return 0
+        return -1, board, a_turn
+    return 0, board, a_turn
 
 
-def play_match(a, b, num_games):
+def play_match(a, b, num_games, writer=None, step=None, offset=0, starting_position=None):
     """
     Play a match between engine a and b
     """
     wins = 0
     losses = 0
     draws = 0
-    for _ in range(num_games):
-        result = play_game(a, b, print_pgn=True)
+    total_score = 0
+    for i in range(num_games):
+        if writer:
+            game_step = step * 1000 + i + offset
+        if starting_position:
+            board = chess.Board(starting_position)
+            board.starting_fen = starting_position
+        else:
+            board = None
+        result, final_board, a_turn = play_game(a, b, print_pgn=True, writer=writer, step=game_step, board=board)
         if result == -1:
             losses += 1
         elif result == 0:
             draws += 1
         elif result == 1:
             wins += 1
+        if a_turn == final_board.turn:
+            total_score += material_count(final_board)
+        else:
+            total_score -= material_count(final_board)
 
-    return wins, losses, draws
+    return wins, losses, draws, total_score / num_games
 
 
 def get_state_action_features(board, move):
@@ -172,13 +195,13 @@ def get_features(board):
 
     # if board.is_checkmate():
         # piece_count[6] = 1
-    piece_count[6] = -material_count(board) / 100
+    piece_count[6] = material_count(board)
 
     return np.concatenate((piece_count, castling, piece_grid.ravel()))
 
 
 class Net(nn.Module):
-    def __init__(self, d, hidden_sizes=[512, 256, 128, 64, 32, 16]):
+    def __init__(self, d, hidden_sizes=[128, 64, 32, 16]):
         super().__init__()
 
         self.first = nn.Linear(d, hidden_sizes[0])
@@ -195,14 +218,14 @@ class Net(nn.Module):
         if x0.ndim == 1:
             # convert to batch view
             x0 = x0.view((1, -1))
-        h = functional.relu(self.first(x0))
+        h = functional.leaky_relu(self.first(x0))
         for layer in self.hidden_layers:
-            h = functional.relu(layer(h))
+            h = functional.leaky_relu(layer(h))
         return self.hidden_fc(h) + self.data_fc(x0)
 
 
 class TorchLearner:
-    def __init__(self, buffer_size=10000, batch_size=5, sync_interval=1000,
+    def __init__(self, buffer_size=75000, batch_size=25, sync_interval=10000,
                  from_file=DEFAULT_MODEL_LOCATION):
         self.buffer = deque(maxlen=buffer_size)
         self.batch_size = batch_size
@@ -219,7 +242,7 @@ class TorchLearner:
         self.target_net.eval()
         self.loss_fn = functional.huber_loss
 
-        self.optimizer = torch.optim.SGD(self.online_net.parameters(), lr=0.01)
+        self.optimizer = torch.optim.Adam(self.online_net.parameters())
 
         self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, verbose=True, patience=50)
 
@@ -234,7 +257,7 @@ class TorchLearner:
         with torch.no_grad():
             return self.online_net(torch.from_numpy(get_state_action_features(board, move).astype(np.float32)))
 
-    def learn(self, reward, prev_board, prev_move, new_board):
+    def store_transition(self, reward, prev_board, prev_move, new_board):
         # store position in buffer
         prev_features = get_state_action_features(prev_board, prev_move).astype(np.float32)
         new_boards = []
@@ -243,15 +266,11 @@ class TorchLearner:
         # if len(self.buffer) < self.buffer.maxlen:
         self.buffer.append((float(reward), prev_features, new_boards))
 
-        return self._q_learn()  # if len(self.buffer) == self.buffer.maxlen else np.nan
+    def learn(self):
+        return np.mean([self._q_learn() for _ in range(NUM_STEPS)])
 
     def _q_learn(self):
         discount = 0.9
-
-        if len(self.buffer) < self.batch_size:
-            return 0
-
-        self.optimizer.zero_grad()
 
         # sample a batch
         batch = random.sample(self.buffer, min(len(self.buffer), self.batch_size))
@@ -263,43 +282,42 @@ class TorchLearner:
         prev_features = torch.from_numpy(np.asarray(prev_features))
 
         new_boards = [torch.from_numpy(np.asarray(x)) for x in new_boards]
+        
+        self.online_net.train()
+        self.optimizer.zero_grad()
 
         # todo: find a better way to do this than a loop
         new_scores = []
         for position_new_boards in new_boards:
             if len(position_new_boards) > 0:
-                with torch.no_grad():
-                    # get best action
-                    next_scores = self.online_net(position_new_boards)
-                    best_index = torch.argmax(next_scores)
+                    with torch.no_grad():
+                        next_scores = self.online_net(position_new_boards)
+                        best_index = torch.argmax(next_scores)
 
-                    # compute target
-                    new_score = self.target_net(position_new_boards[best_index])
+                        new_score = self.target_net(position_new_boards[best_index])
+                        # standard q-learning
+                        # next_scores = self.online_net(position_new_boards)
+                        # new_score = torch.max(next_scores)
 
-                # standard q-learning
-                # next_scores = self.online_net(position_new_boards)
-                # new_score = torch.max(next_scores)
-
-                new_scores.append(new_score)
+                        new_scores.append(new_score)
             else:
                 new_scores.append(0)  # this should only happen in terminal states
 
         new_scores = torch.FloatTensor(new_scores)
-        self.online_net.train()
         prev_scores = self.online_net(prev_features)
 
-        loss = self.loss_fn(prev_scores.view(self.batch_size),
+        loss = self.loss_fn(prev_scores.view(len(batch)),
                             rewards - discount * new_scores)
 
         loss.backward()
 
         torch.nn.utils.clip_grad_norm_(self.online_net.parameters(), 1)
 
-        self.optimizer.step()
-        
+        if len(self.buffer) > self.batch_size:
+            self.optimizer.step()
+            self.update_count += 1
+            
         self.online_net.eval()
-
-        self.update_count += 1
 
         if self.update_count % self.sync_interval == 0:
             self.target_net.load_state_dict(self.online_net.state_dict())
@@ -339,16 +357,12 @@ class LearningEngine(MinimalEngine):
 
         return np.random.choice(best_moves)
 
-    def learn(self, reward, prev_board, prev_move, new_board):
-        loss = self.learner.learn(reward, prev_board, prev_move, new_board)
-        return loss
-
 
 def main():
     from torch.utils.tensorboard import SummaryWriter
 
     time_string = datetime.now().strftime("%Y%m%d-%H%M%S")
-    note = "Minimax_Q_learning_512_SGD"
+    note = "Minimax_Q_learning_256_Adam_Large_batch_Leaky_ReLU_XSteps"
 
     # base_dir = tempfile.TemporaryDirectory().name
     base_dir = "/Users/bert/Desktop"
@@ -360,7 +374,7 @@ def main():
     start_time = time.time()
 
     # Use this next line to load bot weights from disk
-    # engine_learner = LearningEngine(None, None, sys.stderr, learner=TorchLearner(from_file=DEFAULT_MODEL_LOCATION))
+    #engine_learner = LearningEngine(None, None, sys.stderr, learner=TorchLearner(from_file=DEFAULT_MODEL_LOCATION))
     # use this one to re-initialize
     engine_learner = LearningEngine(None, None, sys.stderr, learner=TorchLearner(from_file=None))
 
@@ -419,7 +433,7 @@ def main():
 
             # play a game
             if board.turn == learner_color:
-                epsilon = max(0.01, 1 / np.sqrt((step - eps_reset) / 10 + 100))
+                epsilon = max(0.05, 1 / np.sqrt((step - eps_reset) / 10 + 100))
 
                 # use epsilon-greedy strategy
                 if np.random.rand() < epsilon:
@@ -444,8 +458,7 @@ def main():
 
         # do q-learning on each moves (including opponents)
         for i in range(len(game_moves)):
-            reward = -material_count(game_positions[i + 1]) - \
-                     material_count(game_positions[i])
+            reward = get_reward(game_positions[i], game_positions[i + 1])
             rewards.append(reward)
 
             if game_positions[i].turn == learner_color:
@@ -453,9 +466,7 @@ def main():
             else:
                 learner_reward -= reward
 
-            q_loss = engine_learner.learn(reward, game_positions[i], game_moves[i],
-                                          game_positions[i + 1])
-            q_losses.append(q_loss)
+            engine_learner.learner.store_transition(reward, game_positions[i], game_moves[i], game_positions[i + 1])
 
         # final move
         if outcome and outcome.winner == learner_color:
@@ -468,13 +479,13 @@ def main():
             opponent_draws[opponent_index] += 1
             result_log.append(0)
 
-        rewards.append(reward)
-
         buffer_full = engine_learner.learner.buffer.maxlen == len(engine_learner.learner.buffer)
+
+        q_losses = engine_learner.learner.learn()
 
         # log diagnostic info
         if step % EVAL_INTERVAL == 0:
-            num_games = 5
+            num_games = 10
             rand_wins, rand_losses, rand_ties = play_match(engine_learner, opponent_random, num_games)
             learn_wins, learn_losses, learn_ties = play_match(engine_learner, opponent_learner, num_games)
             hang_wins, hang_losses, hang_ties = play_match(engine_learner, opponent_hanging, num_games)
@@ -505,7 +516,7 @@ def main():
         # if step > 1000:
             # engine_learner.learner.scheduler.step(np.mean(q_loss_record))
 
-        if step > 1 and step % OPPONENT_UPDATE_INTERVAL == 0 and np.mean(result_log) > 0.25:
+        if step > 1 and step % OPPONENT_UPDATE_INTERVAL == 0 and np.mean(result_log) > 0.5:
             print("Updating opponent to current model parameters")
             # update opponent engine
             opponent_learner = LearningEngine(None, "LearningEngine{}".format(step), sys.stderr,
