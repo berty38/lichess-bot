@@ -33,7 +33,7 @@ MAX_MOVES = 200
 BUFFER_MAX_SIZE = 1000000
 EPOCHS = 10
 NUM_GAMES = 1
-MAX_BUFFER_ROUNDS = 20
+MAX_BUFFER_ROUNDS = 100
 LR = 1e-4
 
 STARTING_POSITION = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"  # standard
@@ -118,7 +118,7 @@ class ChessConvNet(nn.Module):
         # self.fc1 = nn.Linear(64 * num_filters, num_filters)
         # self.fc2 = nn.Linear(num_filters, 1)
 
-        num_hidden = 256
+        num_hidden = 768
 
         self.data_linear = nn.Linear(64 * 13, num_hidden)
         self.bn1 = nn.BatchNorm1d(num_hidden)
@@ -383,6 +383,9 @@ def main():
                 buffer.update(game)
             print(f"Full buffer combining {len(game_buffer)} rounds has {len(buffer)} states")
 
+        if len(game_buffer) < MAX_BUFFER_ROUNDS:
+            continue
+
         # Learning
 
         loss_record = 0
@@ -423,7 +426,10 @@ def main():
             if batch_next_features.shape[0] < 1:
                 continue
 
-            batch_next_scores = target_model(batch_next_features)
+            model.eval()
+            with torch.no_grad():
+                batch_next_scores = model(batch_next_features)
+            model.train()
 
             batch_start_indices = np.cumsum([len(x) for x in next_material])
             batch_start_indices = np.concatenate(([0], batch_start_indices))
@@ -432,9 +438,16 @@ def main():
                 if len(next_material[i]):
                     next_scores = -next_material[i] - next_non_terminal[i] * \
                                   batch_next_scores[batch_start_indices[i]:(batch_start_indices[i + 1])]
-                    next_score = torch.max(next_scores)
+                    # next_score_old = torch.max(next_scores)
 
-                    loss = loss_fn(current_scores[i][0], next_score)
+                    best_move = torch.argmax(next_scores)
+
+                    next_score = -next_material[i][best_move] - next_non_terminal[i][best_move] * target_model(
+                        batch_next_features[batch_start_indices[i] + best_move])
+
+                    # assert(torch.allclose(next_score, next_score_old))
+
+                    loss = loss_fn(current_scores[i], next_score.view([1]))
                     total_loss += loss
 
             total_loss.backward()
