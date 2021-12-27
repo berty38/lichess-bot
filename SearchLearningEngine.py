@@ -26,15 +26,16 @@ torch.manual_seed(0)
 random.seed(0)
 np.random.seed(0)
 
-EVAL_INTERVAL = 10
-TARGET_UPDATE = 1000
+NOTE = "MLP64_ReducePlateau_Attackers"
+EVAL_INTERVAL = 120  # seconds between evaluation against baselines
+TARGET_UPDATE = 5000
 BATCH_SIZE = 10
 MAX_MOVES = 200
 BUFFER_MAX_SIZE = 1000000
-EPOCHS = 10
+EPOCHS = 1
 NUM_GAMES = 1
 MAX_BUFFER_ROUNDS = 100
-LR = 1e-4
+LR = 1e-3
 
 STARTING_POSITION = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"  # standard
 # STARTING_POSITION = "7r/8/4k3/8/8/4K3/8/R7 w - - 0 1"  # King and rook vs king and rook
@@ -46,6 +47,7 @@ STARTING_POSITION = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"  
 # STARTING_POSITION = "Q6k/4pppp/8/3q4/8/8/1P6/KR6 b - - 0 1"  # 1 legal move is mate, other is loss
 # STARTING_POSITION = "8/3k4/4n3/8/8/8/2N5/1K6 w - - 0 1"  # King and knight each, no mate possible
 # STARTING_POSITION = "1n2k1n1/8/8/8/8/8/8/1N2K1N1 w - - 0 1"  # King and 2 knights each. No mates possible
+# STARTING_POSITION = "rn1qkbnr/ppp1pppp/3p4/8/4P1b1/P1N5/1PPP1PPP/R1BQKBNR b KQkq - 0 3"  # Hanging queen
 
 
 def batchify(data: list, batch_size: int):
@@ -57,7 +59,10 @@ def batchify(data: list, batch_size: int):
         batches.append(list(islice(iterator, batch_size)))
 
     if remainder:
-        batches[-1].extend(iterator)
+        if batches:
+            batches[-1].extend(iterator)
+        else:
+            batches.append(list(iterator))
 
     return batches
 
@@ -69,11 +74,17 @@ def get_features(board):
 
     # mirror board if black's turn
     if board.turn == chess.BLACK:
-        board = board.mirror()
+        def rank(s):
+            return 7 - chess.square_rank(s)
+    else:
+        def rank(s):
+            return chess.square_rank(s)
 
     all_pieces = board.piece_map().items()
 
     piece_grid = np.zeros((13, 8, 8))
+
+    attacker_grid = np.zeros((12, 8, 8))
 
     for square, piece in all_pieces:
         type_index = PIECE_INDEX[piece.piece_type]
@@ -81,46 +92,54 @@ def get_features(board):
         if piece.color != board.turn:
             type_index += len(PIECE_INDEX)
 
-        position_rank = chess.square_rank(square)
+        position_rank = rank(square)
         position_file = chess.square_file(square)
 
         piece_grid[type_index, position_rank, position_file] = 1
 
+        for attacked_square in board.attacks(square):
+            attacked_rank = rank(attacked_square)
+            attacked_file = chess.square_file(attacked_square)
+
+            attacker_grid[type_index, attacked_rank, attacked_file] += 1
+
     # add castling rights
-    if board.has_kingside_castling_rights(chess.WHITE):
+    if board.has_kingside_castling_rights(board.turn):
         piece_grid[12, 0, 7] = 1
-    if board.has_queenside_castling_rights(chess.WHITE):
+    if board.has_queenside_castling_rights(board.turn):
         piece_grid[12, 0, 0] = 1
-    if board.has_kingside_castling_rights(chess.BLACK):
+    if board.has_kingside_castling_rights(not board.turn):
         piece_grid[12, 7, 7] = 1
-    if board.has_queenside_castling_rights(chess.BLACK):
+    if board.has_queenside_castling_rights(not board.turn):
         piece_grid[12, 7, 7] = 1
 
     # add en passant squares
     ep = board.ep_square
     if ep:
-        piece_grid[12, chess.square_rank(ep), chess.square_file(ep)] = 1
+        piece_grid[12, rank(ep), chess.square_file(ep)] = 1
 
-    return piece_grid
+    features = np.concatenate((piece_grid, attacker_grid), 0)
+
+    return features
 
 
 class ChessConvNet(nn.Module):
     def __init__(self, zero=False):
         super().__init__()
 
-        num_filters = 8
-        filter_size = 17
+        num_filters = 16
+        filter_size = 1
         padding = filter_size // 2
 
-        # self.conv1 = nn.Conv2d(13, num_filters, filter_size, 1, padding)
+        # self.conv1 = nn.Conv2d(13 + 12, num_filters, filter_size, 1, padding)
         # self.conv2 = nn.Conv2d(num_filters, num_filters, filter_size, 1, padding)
         # self.conv3 = nn.Conv2d(d, d, filter_size, 1, padding)
         # self.fc1 = nn.Linear(64 * num_filters, num_filters)
         # self.fc2 = nn.Linear(num_filters, 1)
 
-        num_hidden = 768
+        num_hidden = 64
 
-        self.data_linear = nn.Linear(64 * 13, num_hidden)
+        self.data_linear = nn.Linear(64 * (13 + 12), num_hidden)
         self.bn1 = nn.BatchNorm1d(num_hidden)
         self.data_middle = nn.Linear(num_hidden, num_hidden // 2)
         self.bn2 = nn.BatchNorm1d(num_hidden // 2)
@@ -149,10 +168,17 @@ class ChessConvNet(nn.Module):
         return output
 
     def zero_output(self):
-        torch.nn.init.normal_(self.data_final.weight, 0.0, 1e-5)
-        torch.nn.init.normal_(self.data_final.bias, 0.0, 1e-5)
-        # torch.nn.init.normal_(self.fc2.weight, 0.0, 1e-5)
-        # torch.nn.init.normal_(self.fc2.bias, 0.0, 1e-5)
+        def init(x):
+            torch.nn.init.uniform_(x, -1e-5, 1e-5)
+        init(self.data_final.weight)
+        init(self.data_final.bias)
+        init(self.data_linear.weight)
+        init(self.data_linear.bias)
+        init(self.data_middle.weight)
+        init(self.data_middle.bias)
+        if hasattr(self, "fc2"):
+            init(self.fc2.weight)
+            init(self.fc2.bias)
 
 
 class NetEngine(MinimalEngine):
@@ -163,7 +189,7 @@ class NetEngine(MinimalEngine):
 
         blank_board = chess.Board()
 
-        sample_vector = torch.from_numpy(get_features(blank_board).astype(np.float32)).view(1, 13, 8, 8)
+        sample_vector = torch.from_numpy(get_features(blank_board).astype(np.float32)).view(1, -1, 8, 8)
         self.net = ChessConvNet()
 
         if from_file:
@@ -310,10 +336,10 @@ def update_buffer_self_play(buffer, engine_learner):
 
 def main():
     time_string = datetime.now().strftime("%Y%m%d-%H%M%S")
-    note = "MLP"
+    note = NOTE
 
-    # base_dir = tempfile.TemporaryDirectory().name
-    base_dir = "/Users/bert/Desktop"
+    base_dir = tempfile.TemporaryDirectory().name
+    # base_dir = "/Users/bert/Desktop"
     log_dir = '{}/logs/'.format(base_dir)
     print("Storing logs in {}".format(log_dir))
     writer = SummaryWriter(log_dir + note + time_string, flush_secs=1)
@@ -359,8 +385,11 @@ def main():
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR, amsgrad=True)
     # optimizer =  torch.optim.SGD(model.parameters(), lr=LR, momentum=0.9)
-    # scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, verbose=True)
-    # scheduler = torch.optim.lr_scheduler.CyclicLR(optimizer, 1e-8, 1e-3, step_size_up=100, cycle_momentum=False, verbose=True)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=100, verbose=True)
+    # scheduler = torch.optim.lr_scheduler.CyclicLR(optimizer, 1e-8, 1e-4, step_size_up=100000, cycle_momentum=False,
+    # verbose=False)
+
+    eval_time = time.time()
 
     while True:
         # update engine name
@@ -394,6 +423,8 @@ def main():
             target_model = copy.deepcopy(model)
             target_model.eval()
             # target_model = model
+            
+            optimizer = torch.optim.AdamW(model.parameters(), lr=LR, amsgrad=True)
 
         batches = batchify(buffer.items(), BATCH_SIZE)
 
@@ -467,7 +498,7 @@ def main():
         model.eval()
 
         writer.add_scalar("Learning Loss", loss_record / len(buffer), step)
-        # scheduler.step(loss_record)
+        scheduler.step(loss_record)
         # scheduler.step()
 
         # log diagnostic info
@@ -482,7 +513,8 @@ def main():
             # writer.add_scalar("Target Hanging Queen Score", eval_board_scores[1].data, step)
             # writer.add_scalar("Target Ladder Mate Score", eval_board_scores[2].data, step)
 
-        if step % EVAL_INTERVAL == 0:
+        if time.time() - eval_time > EVAL_INTERVAL:
+            eval_time = time.time()
             num_games = 10
             rand_wins, rand_losses, rand_ties, rand_score = play_match(engine_learner, opponent_random, num_games,
                                                                        writer, step,
