@@ -201,5 +201,5 @@ class XBoardEngine(EngineWrapper):
 
 
 def getHomemadeEngine():
-    from LearningEngine import LearningEngine, TorchLearner
-    return LearningEngine
+    from SearchLearningEngine import NetEngine
+    return NetEngine

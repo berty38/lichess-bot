@@ -11,6 +11,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as functional
 import matplotlib.pyplot as plt
+from functools import cache
 
 from HangingEngine import HangingEngine
 from strategies import MinimalEngine, RandomMove
@@ -24,18 +25,20 @@ from math import ceil
 
 torch.manual_seed(0)
 random.seed(0)
-np.random.seed(0)
+np.random.seed(0) 
 
-NOTE = "MLP64_ReducePlateau_Attackers"
+NOTE = "CNN8_MLP64_Attackers_batch50_Reg"
 EVAL_INTERVAL = 120  # seconds between evaluation against baselines
-TARGET_UPDATE = 5000
-BATCH_SIZE = 10
+TARGET_UPDATE = 1000
+BATCH_SIZE = 50
 MAX_MOVES = 200
 BUFFER_MAX_SIZE = 1000000
 EPOCHS = 1
 NUM_GAMES = 1
-MAX_BUFFER_ROUNDS = 100
-LR = 1e-3
+MAX_BUFFER_ROUNDS = 200
+LR = 1e-4
+ZERO_REGULARIZER = 0.01
+WARM_START = False
 
 STARTING_POSITION = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"  # standard
 # STARTING_POSITION = "7r/8/4k3/8/8/4K3/8/R7 w - - 0 1"  # King and rook vs king and rook
@@ -127,15 +130,15 @@ class ChessConvNet(nn.Module):
     def __init__(self, zero=False):
         super().__init__()
 
-        num_filters = 16
+        num_filters = 8
         filter_size = 1
         padding = filter_size // 2
 
-        # self.conv1 = nn.Conv2d(13 + 12, num_filters, filter_size, 1, padding)
-        # self.conv2 = nn.Conv2d(num_filters, num_filters, filter_size, 1, padding)
+        self.conv1 = nn.Conv2d(13 + 12, num_filters, filter_size, 1, padding)
+        self.conv2 = nn.Conv2d(num_filters, num_filters, filter_size, 1, padding)
         # self.conv3 = nn.Conv2d(d, d, filter_size, 1, padding)
-        # self.fc1 = nn.Linear(64 * num_filters, num_filters)
-        # self.fc2 = nn.Linear(num_filters, 1)
+        self.fc1 = nn.Linear(64 * num_filters, num_filters)
+        self.fc2 = nn.Linear(num_filters, 1)
 
         num_hidden = 64
 
@@ -149,13 +152,13 @@ class ChessConvNet(nn.Module):
         if x0.ndim == 3:
             x0 = x0.view(1, -1, 8, 8)
         output = 0
-        # x = functional.leaky_relu(self.conv1(x0))
-        # x = functional.leaky_relu(self.conv2(x))
+        x = functional.leaky_relu(self.conv1(x0))
+        x = functional.leaky_relu(self.conv2(x))
         # x = functional.leaky_relu(self.conv3(x))
-        # x = torch.flatten(x, 1)
-        # x = functional.leaky_relu(self.fc1(x))
-        # x = self.fc2(x)
-        # output += x
+        x = torch.flatten(x, 1)
+        x = functional.leaky_relu(self.fc1(x))
+        x = self.fc2(x)
+        output += x
 
         # MLP
         h = self.data_linear(torch.flatten(x0, 1))
@@ -179,6 +182,12 @@ class ChessConvNet(nn.Module):
         if hasattr(self, "fc2"):
             init(self.fc2.weight)
             init(self.fc2.bias)
+        if hasattr(self, "conv1"):
+            init(self.conv1.weight)
+            init(self.conv1.bias)
+        if hasattr(self, "conv2"):
+            init(self.conv2.weight)
+            init(self.conv2.bias)
 
 
 class NetEngine(MinimalEngine):
@@ -338,8 +347,8 @@ def main():
     time_string = datetime.now().strftime("%Y%m%d-%H%M%S")
     note = NOTE
 
-    base_dir = tempfile.TemporaryDirectory().name
-    # base_dir = "/Users/bert/Desktop"
+    # base_dir = tempfile.TemporaryDirectory().name
+    base_dir = "/Users/bert/Desktop"
     log_dir = '{}/logs/'.format(base_dir)
     print("Storing logs in {}".format(log_dir))
     writer = SummaryWriter(log_dir + note + time_string, flush_secs=1)
@@ -347,10 +356,10 @@ def main():
     step = 0
     start_time = time.perf_counter()
 
-    # Use this next line to load bot weights from disk
-    # engine_learner = NetEngine(None, None, sys.stderr, from_file=DEFAULT_MODEL_LOCATION)
-    # use this one to re-initialize
-    engine_learner = NetEngine(None, None, sys.stderr, from_file=None)
+    if WARM_START:
+        engine_learner = NetEngine(None, None, sys.stderr, from_file=DEFAULT_MODEL_LOCATION)
+    else:
+        engine_learner = NetEngine(None, None, sys.stderr, from_file=None)
 
     model = engine_learner.net
 
@@ -385,7 +394,7 @@ def main():
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR, amsgrad=True)
     # optimizer =  torch.optim.SGD(model.parameters(), lr=LR, momentum=0.9)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=100, verbose=True)
+    # scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=100, verbose=True)
     # scheduler = torch.optim.lr_scheduler.CyclicLR(optimizer, 1e-8, 1e-4, step_size_up=100000, cycle_momentum=False,
     # verbose=False)
 
@@ -449,7 +458,7 @@ def main():
 
             current_scores = material + model(features)
 
-            total_loss = 0
+            total_loss = ZERO_REGULARIZER * loss_fn(current_scores, material)  #
 
             # collect next features and non-terminal statuses into single batch
             batch_next_features = torch.cat(next_features)
@@ -498,7 +507,7 @@ def main():
         model.eval()
 
         writer.add_scalar("Learning Loss", loss_record / len(buffer), step)
-        scheduler.step(loss_record)
+        # scheduler.step(loss_record)
         # scheduler.step()
 
         # log diagnostic info
@@ -509,7 +518,7 @@ def main():
             writer.add_scalar("Ladder Mate Score", eval_board_scores[2].data, step)
 
             eval_board_scores = target_model(eval_board_features).ravel() + eval_board_material
-            # writer.add_scalar("Target Empty Board Score", eval_board_scores[0], step)
+            writer.add_scalar("Target Empty Board Score", eval_board_scores[0], step)
             # writer.add_scalar("Target Hanging Queen Score", eval_board_scores[1].data, step)
             # writer.add_scalar("Target Ladder Mate Score", eval_board_scores[2].data, step)
 
@@ -531,7 +540,7 @@ def main():
             writer.add_scalar("Score v. Random", rand_score, step)
             torch.save(model.state_dict(), DEFAULT_MODEL_LOCATION)
 
-            plot_filters(model, writer, total_optimizer_steps)
+            # plot_filters(model, writer, total_optimizer_steps)
 
         writer.add_scalar("Buffer Size", len(buffer), step)
 
