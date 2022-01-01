@@ -11,7 +11,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as functional
 import matplotlib.pyplot as plt
-from functools import cache
 
 from HangingEngine import HangingEngine
 from strategies import MinimalEngine, RandomMove
@@ -27,9 +26,9 @@ torch.manual_seed(0)
 random.seed(0)
 np.random.seed(0) 
 
-NOTE = "CNN8_MLP64_Attackers_batch50_Reg"
+NOTE = "CNN12_MLP64_batch50_Reg_Update100_Buffer200_"
 EVAL_INTERVAL = 120  # seconds between evaluation against baselines
-TARGET_UPDATE = 1000
+TARGET_UPDATE = 100
 BATCH_SIZE = 50
 MAX_MOVES = 200
 BUFFER_MAX_SIZE = 1000000
@@ -37,8 +36,9 @@ EPOCHS = 1
 NUM_GAMES = 1
 MAX_BUFFER_ROUNDS = 200
 LR = 1e-4
-ZERO_REGULARIZER = 0.01
+ZERO_REGULARIZER = 0.1
 WARM_START = False
+EMPTY_BOARD_REGULARIZER = 200
 
 STARTING_POSITION = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"  # standard
 # STARTING_POSITION = "7r/8/4k3/8/8/4K3/8/R7 w - - 0 1"  # King and rook vs king and rook
@@ -53,8 +53,10 @@ STARTING_POSITION = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"  
 # STARTING_POSITION = "rn1qkbnr/ppp1pppp/3p4/8/4P1b1/P1N5/1PPP1PPP/R1BQKBNR b KQkq - 0 3"  # Hanging queen
 
 
-def batchify(data: list, batch_size: int):
-    iterator = iter(data)
+def batchify(data, batch_size: int):
+    shuffled_data = list(data)
+    random.shuffle(shuffled_data)
+    iterator = iter(shuffled_data)
     batches = []
     full_batches = len(data) // batch_size
     remainder = len(data) - full_batches * batch_size
@@ -130,22 +132,19 @@ class ChessConvNet(nn.Module):
     def __init__(self, zero=False):
         super().__init__()
 
-        num_filters = 8
+        num_filters = 12
         filter_size = 1
         padding = filter_size // 2
+
+        num_hidden = 64
 
         self.conv1 = nn.Conv2d(13 + 12, num_filters, filter_size, 1, padding)
         self.conv2 = nn.Conv2d(num_filters, num_filters, filter_size, 1, padding)
         # self.conv3 = nn.Conv2d(d, d, filter_size, 1, padding)
-        self.fc1 = nn.Linear(64 * num_filters, num_filters)
-        self.fc2 = nn.Linear(num_filters, 1)
-
-        num_hidden = 64
+        self.fc1 = nn.Linear(64 * num_filters, num_hidden)
 
         self.data_linear = nn.Linear(64 * (13 + 12), num_hidden)
-        self.bn1 = nn.BatchNorm1d(num_hidden)
         self.data_middle = nn.Linear(num_hidden, num_hidden // 2)
-        self.bn2 = nn.BatchNorm1d(num_hidden // 2)
         self.data_final = nn.Linear(num_hidden // 2, 1)
 
     def forward(self, x0):
@@ -154,18 +153,13 @@ class ChessConvNet(nn.Module):
         output = 0
         x = functional.leaky_relu(self.conv1(x0))
         x = functional.leaky_relu(self.conv2(x))
-        # x = functional.leaky_relu(self.conv3(x))
         x = torch.flatten(x, 1)
         x = functional.leaky_relu(self.fc1(x))
-        x = self.fc2(x)
-        output += x
 
         # MLP
         h = self.data_linear(torch.flatten(x0, 1))
-        h = functional.leaky_relu(h)
-        # h = self.bn1(h)
+        h = functional.leaky_relu(h) + x
         h = functional.leaky_relu(self.data_middle(h))
-        # h = self.bn2(h)
         h = self.data_final(h)
         output += h
         return output
@@ -179,9 +173,9 @@ class ChessConvNet(nn.Module):
         init(self.data_linear.bias)
         init(self.data_middle.weight)
         init(self.data_middle.bias)
-        if hasattr(self, "fc2"):
-            init(self.fc2.weight)
-            init(self.fc2.bias)
+        if hasattr(self, "fc1"):
+            init(self.fc1.weight)
+            init(self.fc1.bias)
         if hasattr(self, "conv1"):
             init(self.conv1.weight)
             init(self.conv1.bias)
@@ -392,7 +386,7 @@ def main():
     empty_board_data[2] = []
     empty_board_data[3] = []
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LR, amsgrad=True)
+    optimizer = torch.optim.Adam(model.parameters(), lr=LR)
     # optimizer =  torch.optim.SGD(model.parameters(), lr=LR, momentum=0.9)
     # scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=100, verbose=True)
     # scheduler = torch.optim.lr_scheduler.CyclicLR(optimizer, 1e-8, 1e-4, step_size_up=100000, cycle_momentum=False,
@@ -432,8 +426,6 @@ def main():
             target_model = copy.deepcopy(model)
             target_model.eval()
             # target_model = model
-            
-            optimizer = torch.optim.AdamW(model.parameters(), lr=LR, amsgrad=True)
 
         batches = batchify(buffer.items(), BATCH_SIZE)
 
@@ -460,6 +452,8 @@ def main():
 
             total_loss = ZERO_REGULARIZER * loss_fn(current_scores, material)  #
 
+            total_loss = EMPTY_BOARD_REGULARIZER * loss_fn(model(eval_board_features[0, :, :, :]), torch.zeros([1, 1]))
+
             # collect next features and non-terminal statuses into single batch
             batch_next_features = torch.cat(next_features)
 
@@ -468,7 +462,7 @@ def main():
 
             model.eval()
             with torch.no_grad():
-                batch_next_scores = model(batch_next_features)
+                batch_next_scores = target_model(batch_next_features)
             model.train()
 
             batch_start_indices = np.cumsum([len(x) for x in next_material])
@@ -478,10 +472,9 @@ def main():
                 if len(next_material[i]):
                     next_scores = -next_material[i] - next_non_terminal[i] * \
                                   batch_next_scores[batch_start_indices[i]:(batch_start_indices[i + 1])]
-                    # next_score_old = torch.max(next_scores)
+                    # next_score = torch.max(next_scores)
 
                     best_move = torch.argmax(next_scores)
-
                     next_score = -next_material[i][best_move] - next_non_terminal[i][best_move] * target_model(
                         batch_next_features[batch_start_indices[i] + best_move])
 
@@ -531,6 +524,7 @@ def main():
             hang_wins, hang_losses, hang_ties, hang_score = play_match(engine_learner, opponent_hanging, num_games,
                                                                        writer, step,
                                                                        starting_position=STARTING_POSITION)
+            play_match(engine_learner, engine_learner, num_games, writer, step, starting_position=STARTING_POSITION)
 
             writer.add_scalar("Win Rate v. Random", rand_wins / num_games, step)
             writer.add_scalar("Loss Rate v. Random", rand_losses / num_games, step)
