@@ -27,16 +27,16 @@ torch.manual_seed(0)
 random.seed(0)
 np.random.seed(0) 
 
-NOTE = "CNN12_MLP64_batch50_Reg_Update10_Buffer100_HighLR"
+NOTE = "CNN12_MLP64_batch50_Reg_MarginLoss_Buffer100_L2"
 EVAL_INTERVAL = 120  # seconds between evaluation against baselines
-TARGET_UPDATE = 10
+TARGET_UPDATE = 0
 BATCH_SIZE = 50
 MAX_MOVES = 200
 BUFFER_MAX_SIZE = 1000000
-EPOCHS = 2
+EPOCHS = 1
 NUM_GAMES = 1
 MAX_BUFFER_ROUNDS = 100
-LR = 1e-3
+LR = 1e-4
 ZERO_REGULARIZER = 0.1
 WARM_START = False
 EMPTY_BOARD_REGULARIZER = 100
@@ -129,6 +129,34 @@ def get_features(board):
     return features
 
 
+class ChessResnet(nn.Module):
+    def __init__(self, depth=3, width=128):
+        super().__init__()
+        d = 64 * (12 + 13)
+        self.in_layers = nn.ModuleList([nn.Linear(d, width) for _ in range(depth)])
+        self.mid_layers = nn.ModuleList([nn.Linear(width, width) for _ in range(depth)])
+        self.final = nn.Linear(width, 1)
+
+    def forward(self, x):
+        
+        if x.ndim == 3:
+            x = x.view(1, -1, 8, 8)
+        x = torch.flatten(x, 1)
+
+        h = 0
+        for in_layer, mid_layer in zip(self.in_layers, self.mid_layers):
+            h_in = functional.leaky_relu(in_layer(x))
+            h = functional.leaky_relu(mid_layer(h + h_in))
+
+        return self.final(h)
+        
+    def zero_output(self):
+        def init(x):
+            torch.nn.init.uniform_(x, -1e-5, 1e-5)
+        init(self.final.weight)
+        init(self.final.bias)
+
+
 class ChessConvNet(nn.Module):
     def __init__(self, zero=False):
         super().__init__()
@@ -195,6 +223,7 @@ class NetEngine(MinimalEngine):
 
         sample_vector = torch.from_numpy(get_features(blank_board).astype(np.float32)).view(1, -1, 8, 8)
         self.net = ChessConvNet()
+        # self.net = ChessResnet()
 
         if from_file:
             self.net.load_state_dict(torch.load(from_file))
@@ -372,6 +401,7 @@ def main():
     total_optimizer_steps = 0
 
     loss_fn = nn.HuberLoss()
+    loss_fn = nn.MSELoss()
 
     update_buffer = update_buffer_self_play
 
@@ -425,10 +455,13 @@ def main():
 
         loss_record = 0
 
-        if step % TARGET_UPDATE == 0:
+        if TARGET_UPDATE and step % TARGET_UPDATE == 0:
             target_model = copy.deepcopy(model)
             target_model.eval()
             # target_model = model
+
+        if TARGET_UPDATE == 0:
+            target_model = model
 
         batches = batchify(buffer.items(), BATCH_SIZE)
 
@@ -464,10 +497,7 @@ def main():
             if batch_next_features.shape[0] < 1:
                 continue
 
-            model.eval()
-            with torch.no_grad():
-                batch_next_scores = target_model(batch_next_features)
-            model.train()
+            batch_next_scores = target_model(batch_next_features)
 
             batch_start_indices = np.cumsum([len(x) for x in next_material])
             batch_start_indices = np.concatenate(([0], batch_start_indices))
@@ -476,16 +506,20 @@ def main():
                 if len(next_material[i]):
                     next_scores = -next_material[i] - next_non_terminal[i] * \
                                   batch_next_scores[batch_start_indices[i]:(batch_start_indices[i + 1])]
-                    # next_score = torch.max(next_scores)
+                    next_score = torch.max(next_scores)
 
-                    best_move = torch.argmax(next_scores)
-                    next_score = -next_material[i][best_move] - next_non_terminal[i][best_move] * target_model(
-                        batch_next_features[batch_start_indices[i] + best_move])
+                    # best_move = torch.argmax(next_scores)
+                    # next_score = -next_material[i][best_move] - next_non_terminal[i][best_move] * target_model(
+                    #     batch_next_features[batch_start_indices[i] + best_move])
 
                     # assert(torch.allclose(next_score, next_score_old))
 
                     loss = loss_fn(current_scores[i], next_score.view([1]))
                     total_loss += loss
+
+                    margin_loss = functional.margin_ranking_loss(current_scores[i], next_scores, torch.ones((1, 1)))
+
+                    total_loss += margin_loss
 
             total_loss.backward()
 

@@ -218,7 +218,7 @@ class ScoreEngine(MinimalEngine):
         return -best_score
 
     def search(self, board, time_limit, ponder):
-        print("Searching with time limit {} and ponder {}, turn is {}".format(time_limit, ponder, board.turn))
+        # print("Searching with time limit {} and ponder {}, turn is {}".format(time_limit, ponder, board.turn))
         # store current position
 
         if isinstance(time_limit, chess.engine.Limit):
@@ -227,7 +227,7 @@ class ScoreEngine(MinimalEngine):
             # target 50 moves
             remaining = max(15, 40 - board.fullmove_number)
             target_time = time_limit / remaining / 1000
-        print("Trying to make move in {} seconds".format(target_time))
+        # print("Trying to make move in {} seconds".format(target_time))
         deadline = time.time() + target_time
 
         self.store_position(board)
@@ -236,7 +236,7 @@ class ScoreEngine(MinimalEngine):
 
         for depth in range(1, self.max_depth + 1):
 
-            print("Trying depth {}".format(depth))
+            # print("Trying depth {}".format(depth))
 
             best_moves = []
             best_score = -INFINITY
@@ -258,10 +258,10 @@ class ScoreEngine(MinimalEngine):
                 elif score == best_score:
                     best_moves.append(move)
 
-            print("Found {} moves with score {}".format(len(best_moves), best_score))
+            # print("Found {} moves with score {}".format(len(best_moves), best_score))
 
             if deadline and time.time() > deadline:
-                print("Ran out of time at depth {}".format(depth))
+                # print("Ran out of time at depth {}".format(depth))
                 break
 
         best_move = random.choice(best_moves)
