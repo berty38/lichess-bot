@@ -27,19 +27,20 @@ torch.manual_seed(0)
 random.seed(0)
 np.random.seed(0) 
 
-NOTE = "CNN12_MLP64_batch50_Reg_MarginLoss_Buffer100_L2"
+NOTE = "CNN128_MLP2048_batch50_Reg_MarginLoss_Buffer1_L2_MaxLoss"
 EVAL_INTERVAL = 120  # seconds between evaluation against baselines
-TARGET_UPDATE = 0
-BATCH_SIZE = 50
-MAX_MOVES = 200
-BUFFER_MAX_SIZE = 1000000
-EPOCHS = 1
-NUM_GAMES = 1
-MAX_BUFFER_ROUNDS = 100
-LR = 1e-4
-ZERO_REGULARIZER = 0.1
-WARM_START = False
-EMPTY_BOARD_REGULARIZER = 100
+TARGET_UPDATE = 0  # How many steps between updates of the target model
+BATCH_SIZE = 50  # number of board positions per gradient batch
+MAX_MOVES = 200  # maximum number of moves in simulated games for training data
+BUFFER_MAX_SIZE = 1000000  # max number of positions in buffer
+EPOCHS = 100  # number of epochs before forcibly adding a new game to the buffer
+NUM_GAMES = 1  # number of games to add when adding new positions
+MAX_BUFFER_ROUNDS = 1  # max number of games in buffer
+LR = 1e-4  # learning rate
+ZERO_REGULARIZER = 0.1  # weight for zero score regularizer from initial board
+WARM_START = False  # whether to load model from disk
+ANCHOR_REGULARIZER = 100  # weight for labeled position regularizer
+STORE_LOG = True  # whether to store tensorboard log
 
 STARTING_POSITION = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"  # standard
 # STARTING_POSITION = "7r/8/4k3/8/8/4K3/8/R7 w - - 0 1"  # King and rook vs king and rook
@@ -161,11 +162,11 @@ class ChessConvNet(nn.Module):
     def __init__(self, zero=False):
         super().__init__()
 
-        num_filters = 12
+        num_filters = 128
         filter_size = 1
         padding = filter_size // 2
 
-        num_hidden = 64
+        num_hidden = 2048
 
         self.conv1 = nn.Conv2d(13 + 12, num_filters, filter_size, 1, padding)
         self.conv2 = nn.Conv2d(num_filters, num_filters, filter_size, 1, padding)
@@ -298,7 +299,7 @@ def expand_state(board):
         board.push(move)
         next_features.append(get_features(board))
         next_material.append(material_count(board))
-        next_non_terminal.append(0 if board.is_game_over() else 1)
+        next_non_terminal.append(0 if board.is_checkmate() else 1)
         board.pop()
 
     key = board._transposition_key()
@@ -352,7 +353,7 @@ def update_buffer_self_play(buffer, engine_learner):
             if board._transposition_key() not in buffer:
                 key, data = expand_state(board)
                 buffer[key] = data
-            if random.random() < 0.1:
+            if random.random() < 0.25:
                 move = random.choice(list(board.legal_moves))
             else:
                 move = engine_learner.search(board, 10000, 10000, max_tolerance=0.1)
@@ -367,17 +368,72 @@ def update_buffer_self_play(buffer, engine_learner):
         print(f"Buffer size {len(buffer)}. Game {gn}: {outcome_str}.")
 
 
+def update_buffer_max_loss(buffer, engine_learner):
+    model = engine_learner.net
+    for gn in range(NUM_GAMES):
+        board = chess.Board(STARTING_POSITION)
+        board.starting_fen = STARTING_POSITION
+        while not board.is_game_over(claim_draw=False) and len(board.move_stack) < MAX_MOVES:
+            if board._transposition_key() not in buffer:
+                key, data = expand_state(board)
+                buffer[key] = data
+
+            chosen_move = None
+            chosen_loss = 0
+
+            moves = np.array(list(board.legal_moves))
+
+            features = []
+            material_counts = np.zeros(moves.size)
+            non_terminal = np.zeros(moves.size)
+
+            for i, move in enumerate(moves):
+                board.push(move)
+                features.append(get_features(board))
+                material_counts[i] = material_count(board)
+                if not board.is_game_over():
+                    non_terminal[i] = 1
+                board.pop()
+
+            features = torch.from_numpy(np.asarray(features, dtype=np.float32))
+            with torch.no_grad():
+                scores = -non_terminal * model(features).numpy().ravel() - material_counts
+
+                current_score = material_count(board)
+                if not board.is_game_over():
+                    current_score += model(torch.from_numpy(get_features(board).astype(np.float32))).numpy().ravel()[0]
+
+            loss = np.abs(current_score - scores)
+
+            best_moves = moves[loss.max() - loss < 1e-3]
+
+            chosen_move = np.random.choice(best_moves)
+
+            board.push(chosen_move)
+
+            # commented out because there's no need to learn from terminal states
+            # if board._transposition_key() not in buffer:
+            #     key, data = expand_state(board)
+            #     buffer[key] = data
+
+        outcome_str = "mate" if board.is_checkmate() else "draw"
+        print(f"Buffer size {len(buffer)}. Game {gn}: {outcome_str}.")
+
+
 def main():
     time_string = datetime.now().strftime("%Y%m%d-%H%M%S")
     note = NOTE
 
-    # base_dir = tempfile.TemporaryDirectory().name
-    base_dir = "/Users/bert/Desktop"
+    if STORE_LOG:
+        base_dir = "/Users/bert/Desktop"
+    else:
+        base_dir = tempfile.TemporaryDirectory().name
+
     log_dir = '{}/logs/'.format(base_dir)
     print("Storing logs in {}".format(log_dir))
     writer = SummaryWriter(log_dir + note + time_string, flush_secs=1)
 
-    step = 0
+    epoch = 0
     start_time = time.perf_counter()
 
     if WARM_START:
@@ -403,13 +459,12 @@ def main():
     loss_fn = nn.HuberLoss()
     loss_fn = nn.MSELoss()
 
-    update_buffer = update_buffer_self_play
-
     # boards for evaluation
     empty = chess.Board()
     hanging_queen = chess.Board("rn1qkbnr/ppp1pppp/3p4/8/4P1b1/P1N5/1PPP1PPP/R1BQKBNR b KQkq - 0 3")
     ladder_mate = chess.Board("5rr1/1k6/8/8/7K/8/4R3/2R5 w - - 0 1")
-    eval_boards = [empty, hanging_queen, ladder_mate]
+    ladder_mate_in_one = chess.Board("5rr1/k7/8/8/7K/8/1R6/2R5 w - - 2 2")
+    eval_boards = [empty, hanging_queen, ladder_mate, ladder_mate_in_one]
     eval_board_features = [get_features(x).astype(np.float32) for x in eval_boards]
     eval_board_features = torch.from_numpy(np.asarray(eval_board_features))
     eval_board_material = torch.from_numpy(np.asarray([material_count(x) for x in eval_boards]))
@@ -418,7 +473,13 @@ def main():
     empty_board_data[2] = []
     empty_board_data[3] = []
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=LR)
+    # Anchor boards
+    anchor_boards = [empty,]
+    anchor_board_values = torch.from_numpy(np.asarray([0,]))
+    anchor_board_features = [get_features(x).astype(np.float32) for x in anchor_boards]
+    anchor_board_features = torch.from_numpy(np.asarray(anchor_board_features))
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
     # optimizer =  torch.optim.SGD(model.parameters(), lr=LR, momentum=0.9)
     # scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=100, verbose=True)
     # scheduler = torch.optim.lr_scheduler.CyclicLR(optimizer, 1e-8, 1e-4, step_size_up=100000, cycle_momentum=False,
@@ -429,16 +490,20 @@ def main():
 
     while True:
         # update engine name
-        engine_learner.engine.id["name"] = "NetEngine{}".format(step)
+        engine_learner.engine.id["name"] = "NetEngine{}".format(epoch)
 
         # generate some new positions to put in the buffer
 
         model.eval()
 
-        if step % EPOCHS == 0:
+        if epoch % EPOCHS == 0:
             new_buffer = {}
 
-            update_buffer(new_buffer, engine_learner)
+            # alternate between adding game played against self versus max_play
+            if epoch % 2 == 0:
+                update_buffer_self_play(new_buffer, engine_learner)
+            else:
+                update_buffer_max_loss(new_buffer, engine_learner)
 
             game_buffer.append(new_buffer)
 
@@ -446,7 +511,7 @@ def main():
 
             for game in game_buffer:
                 buffer.update(game)
-            print(f"Full buffer combining {len(game_buffer)} rounds has {len(buffer)} states")
+            print(f"New games added. Full buffer combining {len(game_buffer)} rounds has {len(buffer)} states")
 
         if len(game_buffer) < MAX_BUFFER_ROUNDS:
             continue
@@ -455,7 +520,7 @@ def main():
 
         loss_record = 0
 
-        if TARGET_UPDATE and step % TARGET_UPDATE == 0:
+        if TARGET_UPDATE and epoch % TARGET_UPDATE == 0:
             target_model = copy.deepcopy(model)
             target_model.eval()
             # target_model = model
@@ -488,13 +553,13 @@ def main():
 
             total_loss = ZERO_REGULARIZER * functional.l1_loss(current_scores, material)
 
-            total_loss = EMPTY_BOARD_REGULARIZER * functional.l1_loss(model(eval_board_features[0, :, :, :]),
-                                                                      torch.zeros([1, 1]))
+            total_loss = ANCHOR_REGULARIZER * functional.l1_loss(model(anchor_board_features).view([-1]),
+                                                                 anchor_board_values)
 
             # collect next features and non-terminal statuses into single batch
             batch_next_features = torch.cat(next_features)
 
-            if batch_next_features.shape[0] < 1:
+            if batch_next_features.shape[0] <= 1:
                 continue
 
             batch_next_scores = target_model(batch_next_features)
@@ -537,19 +602,20 @@ def main():
 
         model.eval()
 
-        writer.add_scalar("Learning Loss", loss_record / len(buffer), step)
+        writer.add_scalar("Learning Loss", loss_record / len(buffer), epoch)
         # scheduler.step(loss_record)
         # scheduler.step()
 
         # log diagnostic info
         with torch.no_grad():
             eval_board_scores = model(eval_board_features).ravel() + eval_board_material
-            writer.add_scalar("Empty Board Score", eval_board_scores[0], step)
-            writer.add_scalar("Hanging Queen Score", eval_board_scores[1].data, step)
-            writer.add_scalar("Ladder Mate Score", eval_board_scores[2].data, step)
+            writer.add_scalar("Empty Board Score", eval_board_scores[0], epoch * 1000)
+            writer.add_scalar("Hanging Queen Score", eval_board_scores[1].data, epoch)
+            writer.add_scalar("Ladder Mate Score", eval_board_scores[2].data, epoch)
+            writer.add_scalar("Ladder Mate-in-1 Score", eval_board_scores[3].data, epoch)
 
-            eval_board_scores = target_model(eval_board_features).ravel() + eval_board_material
-            writer.add_scalar("Target Empty Board Score", eval_board_scores[0], step)
+            # eval_board_scores = target_model(eval_board_features).ravel() + eval_board_material
+            # writer.add_scalar("Target Empty Board Score", eval_board_scores[0], epoch)
             # writer.add_scalar("Target Hanging Queen Score", eval_board_scores[1].data, step)
             # writer.add_scalar("Target Ladder Mate Score", eval_board_scores[2].data, step)
 
@@ -558,47 +624,53 @@ def main():
             eval_time = time.time()
             num_games = 10
             rand_wins, rand_losses, rand_ties, rand_score = play_match(engine_learner, opponent_random, num_games,
-                                                                       writer, step,
+                                                                       writer, "Random",
+                                                                       epoch,
                                                                        starting_position=STARTING_POSITION)
 
             hang_wins, hang_losses, hang_ties, hang_score = play_match(engine_learner, opponent_hanging, num_games,
-                                                                       writer, step,
+                                                                       writer, "Hanging",
+                                                                       epoch,
                                                                        starting_position=STARTING_POSITION)
 
-            play_match(engine_learner, engine_learner, num_games, writer, step, starting_position=STARTING_POSITION)
+            play_match(engine_learner, engine_learner, num_games, writer, "Self", epoch,
+                       starting_position=STARTING_POSITION)
 
-            writer.add_scalar("Win Rate v. Random", rand_wins / num_games, step)
-            writer.add_scalar("Loss Rate v. Random", rand_losses / num_games, step)
-            writer.add_scalar("Win Rate v. Hanging", hang_wins / num_games, step)
-            writer.add_scalar("Loss Rate v. Hanging", hang_losses / num_games, step)
-            writer.add_scalar("Score v. Hanging", hang_score, step)
-            writer.add_scalar("Score v. Random", rand_score, step)
-            torch.save(model.state_dict(), DEFAULT_MODEL_LOCATION)
+            writer.add_scalar("Win Rate v. Random", rand_wins / num_games, epoch)
+            writer.add_scalar("Loss Rate v. Random", rand_losses / num_games, epoch)
+            writer.add_scalar("Win Rate v. Hanging", hang_wins / num_games, epoch)
+            writer.add_scalar("Loss Rate v. Hanging", hang_losses / num_games, epoch)
+            writer.add_scalar("Score v. Hanging", hang_score, epoch)
+            writer.add_scalar("Score v. Random", rand_score, epoch)
+            if STORE_LOG:
+                torch.save(model.state_dict(), DEFAULT_MODEL_LOCATION)
 
             if time.time() - minimax_eval_time > EVAL_INTERVAL * 10:
                 # compare against slow minimax agent
 
                 mini_wins, mini_losses, mini_ties, mini_score = play_match(engine_learner, opponent_minimax, num_games,
-                                                                           writer, step,
+                                                                           writer, "Minimax", epoch,
                                                                            starting_position=STARTING_POSITION)
 
                 minimax_eval_time = time.time()
 
-                writer.add_scalar("Win Rate v. Minimax", mini_wins / num_games, step)
-                writer.add_scalar("Loss Rate v. Minimax", mini_losses / num_games, step)
-                writer.add_scalar("Score v. Minimax", mini_score, step)
+                writer.add_scalar("Win Rate v. Minimax", mini_wins / num_games, epoch)
+                writer.add_scalar("Loss Rate v. Minimax", mini_losses / num_games, epoch)
+                writer.add_scalar("Score v. Minimax", mini_score, epoch)
 
             # plot_filters(model, writer, total_optimizer_steps)
 
-        writer.add_scalar("Buffer Size", len(buffer), step)
+        writer.add_scalar("Buffer Size", len(buffer), epoch)
 
         elapsed_time = time.perf_counter() - start_time
 
-        step += 1
+        epoch += 1
         
-        print("Completed {} epochs ({:.2f} rounds/sec). Loss {}".format(step, step / elapsed_time,
+        print("Completed {} epochs ({:.2f} rounds/sec). Loss {}".format(epoch, epoch / elapsed_time,
                                                                         loss_record / len(buffer)))
         writer.flush()
+
+        epoch_loss = loss_record / len(buffer)
 
 
 if __name__ == "__main__":

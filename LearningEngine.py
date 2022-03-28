@@ -85,7 +85,7 @@ def print_game(board, white_name, black_name):
     return " ".join(to_print)
 
 
-def play_game(a, b, board=None, print_pgn=False, writer=None, step=None):
+def play_game(a, b, board=None, print_pgn=False, writer=None, tag=None, step=None):
     if not board:
         board = chess.Board()
     max_moves = 200
@@ -108,7 +108,7 @@ def play_game(a, b, board=None, print_pgn=False, writer=None, step=None):
         pgn = print_game(board, white.engine.id["name"], black.engine.id["name"])
 
         if writer:
-            writer.add_text("PGN", pgn, step)
+            writer.add_text(f"PGN_{tag}", pgn, step)
         else:
             print(pgn)
 
@@ -119,7 +119,7 @@ def play_game(a, b, board=None, print_pgn=False, writer=None, step=None):
     return 0, board, a_turn
 
 
-def play_match(a, b, num_games, writer=None, step=None, offset=0, starting_position=None):
+def play_match(a, b, num_games, writer=None, tag=None, step=None, offset=0, starting_position=None):
     """
     Play a match between engine a and b
     """
@@ -135,7 +135,7 @@ def play_match(a, b, num_games, writer=None, step=None, offset=0, starting_posit
             board.starting_fen = starting_position
         else:
             board = None
-        result, final_board, a_turn = play_game(a, b, print_pgn=True, writer=writer, step=game_step, board=board)
+        result, final_board, a_turn = play_game(a, b, print_pgn=True, writer=writer, tag=tag, step=game_step, board=board)
         if result == -1:
             losses += 1
         elif result == 0:
